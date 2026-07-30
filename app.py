@@ -42,31 +42,46 @@ app_mode = st.sidebar.selectbox(
     ["Interactive Predictor & Diagnostics", "Model Evaluations & Metrics"]
 )
 
-# Load Data
+# =========================================================================
+# MEMORY-OPTIMIZED DATA LOADING (Prevents OOM Crashes)
+# =========================================================================
 @st.cache_data
 def load_data():
-    return pd.read_csv('DelayedFlights.csv')
+    cols = [
+        'ArrDelay', 'CRSDepTime', 'TailNum', 'Distance', 
+        'CarrierDelay', 'WeatherDelay', 'NASDelay', 'TaxiOut', 'AirTime'
+    ]
+    # Read only required columns
+    df = pd.read_csv('DelayedFlights.csv', usecols=cols)
+    
+    # Cap dataset size for Streamlit Cloud 1GB RAM limit
+    if len(df) > 50000:
+        df = df.sample(n=50000, random_state=42).reset_index(drop=True)
+        
+    # Downcast float64 to float32 to save RAM
+    float_cols = df.select_dtypes(include=['float64']).columns
+    df[float_cols] = df[float_cols].astype('float32')
+    return df
 
 try:
     df = load_data()
 except Exception as e:
-    st.error(f"Error loading 'DelayedFlights.csv'. Make sure it is in the same folder as app.py. Details: {e}")
+    st.error(f"Error loading 'DelayedFlights.csv'. Make sure it is in the same repository folder. Details: {e}")
     st.stop()
 
 # =========================================================================
-# CACHED MODEL TRAINING ROUTINE (TRAINS ON ALL DATA)
+# CACHED MODEL TRAINING ROUTINE
 # =========================================================================
 @st.cache_resource
 def train_models(test_r):
-    # --- CODE 1 PREP (ALL DATA) ---
+    # --- CODE 1 PREP ---
     df_c1 = df.copy()
     df_c1['Is_Severe_Delay'] = (df_c1['ArrDelay'] >= 45).astype(int)
-    df_c1['DepHour'] = df_c1['CRSDepTime'] // 100
+    df_c1['DepHour'] = (df_c1['CRSDepTime'] // 100).astype(int)
     df_c1 = df_c1.sort_values(['TailNum', 'CRSDepTime']).reset_index(drop=True)
     df_c1['Inbound_Leg_ArrDelay'] = df_c1.groupby('TailNum')['ArrDelay'].shift(1).fillna(0)
 
     features_c1 = ['Distance', 'DepHour', 'Inbound_Leg_ArrDelay']
-    # Removed .sample() to use all available clean data
     df_clean_c1 = df_c1[features_c1 + ['ArrDelay', 'Is_Severe_Delay']].dropna()
 
     X_c1 = df_clean_c1[features_c1]
@@ -84,11 +99,11 @@ def train_models(test_r):
     lin_reg_c1 = LinearRegression().fit(X_train_scaled_c1, y_train_reg_c1)
     log_reg_c1 = LogisticRegression(class_weight='balanced', max_iter=500).fit(X_train_scaled_c1, y_train_class_c1)
     dt_cls_c1  = DecisionTreeClassifier(criterion='gini', max_depth=3, class_weight='balanced', random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
-    rf_cls_c1  = RandomForestClassifier(n_estimators=50, max_depth=6, class_weight='balanced', n_jobs=-1, random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
-    kmeans_c1  = KMeans(n_clusters=2, random_state=42, n_init=10).fit(X_train_scaled_c1)
-    nn_cls_c1  = MLPClassifier(hidden_layer_sizes=(8, 4), max_iter=150, random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
+    rf_cls_c1  = RandomForestClassifier(n_estimators=30, max_depth=5, class_weight='balanced', n_jobs=-1, random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
+    kmeans_c1  = KMeans(n_clusters=2, random_state=42, n_init=5).fit(X_train_scaled_c1)
+    nn_cls_c1  = MLPClassifier(hidden_layer_sizes=(8, 4), max_iter=100, random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
 
-    # --- CODE 2 PREP (ALL DATA) ---
+    # --- CODE 2 PREP ---
     df_c2 = df.copy()
     delay_cols = ['WeatherDelay', 'NASDelay', 'CarrierDelay']
     df_c2[delay_cols] = df_c2[delay_cols].fillna(0)
@@ -106,7 +121,6 @@ def train_models(test_r):
 
     df_c2['RootCause'] = df_c2.apply(assign_root_cause, axis=1)
     features_c2 = ['TaxiOut', 'AirTime', 'Distance']
-    # Removed .sample() to use all available clean data
     df_clean_c2 = df_c2[features_c2 + ['RootCause', 'CarrierDelay']].dropna()
 
     X_c2 = df_clean_c2[features_c2]
@@ -124,8 +138,8 @@ def train_models(test_r):
     lin_reg_c2 = LinearRegression().fit(X_train_scaled_c2, y_train_reg_c2)
     log_reg_c2 = LogisticRegression(class_weight='balanced', max_iter=500).fit(X_train_scaled_c2, y_train_class_c2)
     dt_cls_c2  = DecisionTreeClassifier(criterion='gini', max_depth=3, class_weight='balanced', random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
-    rf_cls_c2  = RandomForestClassifier(n_estimators=50, max_depth=6, class_weight='balanced', n_jobs=-1, random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
-    kmeans_c2  = KMeans(n_clusters=3, random_state=42, n_init=10).fit(X_train_scaled_c2)
+    rf_cls_c2  = RandomForestClassifier(n_estimators=30, max_depth=5, class_weight='balanced', n_jobs=-1, random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
+    kmeans_c2  = KMeans(n_clusters=3, random_state=42, n_init=5).fit(X_train_scaled_c2)
     nn_cls_c2  = MLPClassifier(hidden_layer_sizes=(8, 4), max_iter=100, random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
 
     return (
@@ -135,7 +149,7 @@ def train_models(test_r):
          lin_reg_c2, log_reg_c2, dt_cls_c2, rf_cls_c2, kmeans_c2, nn_cls_c2)
     )
 
-with st.spinner("Initializing and training models on full dataset... Please wait a moment."):
+with st.spinner("Initializing models... Please wait a moment."):
     c1_bundle, c2_bundle = train_models(test_ratio)
 
 (X_test_c1, y_test_class_c1, y_test_reg_c1, X_test_scaled_c1, scaler_c1, features_c1, 
@@ -143,7 +157,6 @@ with st.spinner("Initializing and training models on full dataset... Please wait
 
 (X_test_c2, y_test_class_c2, y_test_reg_c2, X_test_scaled_c2, scaler_c2, features_c2, 
  lin_reg_c2, log_reg_c2, dt_cls_c2, rf_cls_c2, kmeans_c2, nn_cls_c2) = c2_bundle
-
 
 # =========================================================================
 # VIEW 1: INTERACTIVE PREDICTOR & DIAGNOSTICS
@@ -184,9 +197,8 @@ if app_mode == "Interactive Predictor & Diagnostics":
         res_col3.metric("Neural Network (MLP)", "DELAYED ⚠️" if nn_cls_c1.predict(input_scaled)[0] == 1 else "ON-TIME 🟢")
         res_col3.metric("K-Means Risk Cluster", f"Group #{kmeans_c1.predict(input_scaled)[0]}")
         
-        # --- ALL CODE 1 VISUALIZATIONS ---
         st.markdown("---")
-        st.subheader("📊 Comprehensive Model Visualizations & Insights")
+        st.subheader("📊 Model Visualizations & Insights")
         
         v_col1, v_col2 = st.columns(2)
         with v_col1:
@@ -198,12 +210,14 @@ if app_mode == "Interactive Predictor & Diagnostics":
             ax.set_xlabel('Actual Delay')
             ax.set_ylabel('Predicted Delay')
             st.pyplot(fig)
+            plt.close(fig)
             
         with v_col2:
             fig, ax = plt.subplots(figsize=(6, 4))
             sns.barplot(x=list(log_reg_c1.coef_[0]), y=features_c1, ax=ax, palette='viridis', hue=features_c1, legend=False)
             ax.set_title('Logistic Regression: Feature Weights')
             st.pyplot(fig)
+            plt.close(fig)
 
         v_col3, v_col4 = st.columns(2)
         with v_col3:
@@ -211,6 +225,7 @@ if app_mode == "Interactive Predictor & Diagnostics":
             pd.Series(rf_cls_c1.feature_importances_, index=features_c1).plot(kind='barh', ax=ax, color='teal')
             ax.set_title("Random Forest Feature Importance")
             st.pyplot(fig)
+            plt.close(fig)
             
         with v_col4:
             fig, ax = plt.subplots(figsize=(6, 4))
@@ -219,6 +234,7 @@ if app_mode == "Interactive Predictor & Diagnostics":
             ax.set_xlabel('Distance')
             ax.set_ylabel('Inbound Leg ArrDelay')
             st.pyplot(fig)
+            plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(8, 4))
         ax.plot(nn_cls_c1.loss_curve_, color='purple', lw=2)
@@ -226,11 +242,13 @@ if app_mode == "Interactive Predictor & Diagnostics":
         ax.set_xlabel('Iterations / Epochs')
         ax.set_ylabel('Loss')
         st.pyplot(fig)
+        plt.close(fig)
             
         st.write("#### Decision Tree Diagram")
         fig, ax = plt.subplots(figsize=(10, 4))
         plot_tree(dt_cls_c1, feature_names=features_c1, class_names=['On-Time', 'Delayed'], filled=True, ax=ax, fontsize=8)
         st.pyplot(fig)
+        plt.close(fig)
 
     else:
         st.subheader("Enter Operational Parameters (Code 2)")
@@ -266,7 +284,7 @@ if app_mode == "Interactive Predictor & Diagnostics":
         res_col2.metric("K-Means Profile", cluster_meanings.get(assigned_cluster, f"Cluster #{assigned_cluster}"))
         
         st.markdown("---")
-        st.subheader("📊 Comprehensive Diagnostic Visualizations & Insights")
+        st.subheader("📊 Diagnostic Visualizations & Insights")
         
         v_col1, v_col2 = st.columns(2)
         with v_col1:
@@ -278,6 +296,7 @@ if app_mode == "Interactive Predictor & Diagnostics":
             ax.set_xlabel('Actual Carrier Delay')
             ax.set_ylabel('Predicted Carrier Delay')
             st.pyplot(fig)
+            plt.close(fig)
             
         with v_col2:
             fig, ax = plt.subplots(figsize=(6, 4))
@@ -285,6 +304,7 @@ if app_mode == "Interactive Predictor & Diagnostics":
             sns.heatmap(coef_df, annot=True, fmt=".2f", cmap='coolwarm', center=0, ax=ax)
             ax.set_title("Logistic Reg: Feature Weights Heatmap")
             st.pyplot(fig)
+            plt.close(fig)
 
         v_col3, v_col4 = st.columns(2)
         with v_col3:
@@ -292,6 +312,7 @@ if app_mode == "Interactive Predictor & Diagnostics":
             pd.Series(rf_cls_c2.feature_importances_, index=features_c2).plot(kind='bar', color='darkgreen', ax=ax, rot=0)
             ax.set_title("Random Forest Feature Importance")
             st.pyplot(fig)
+            plt.close(fig)
             
         with v_col4:
             fig, ax = plt.subplots(figsize=(6, 4))
@@ -300,6 +321,7 @@ if app_mode == "Interactive Predictor & Diagnostics":
             ax.set_xlabel('TaxiOut')
             ax.set_ylabel('AirTime')
             st.pyplot(fig)
+            plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(8, 4))
         ax.plot(nn_cls_c2.loss_curve_, color='orange', lw=2)
@@ -307,11 +329,13 @@ if app_mode == "Interactive Predictor & Diagnostics":
         ax.set_xlabel('Iterations / Epochs')
         ax.set_ylabel('Loss')
         st.pyplot(fig)
+        plt.close(fig)
             
         st.write("#### Decision Tree Breakdown")
         fig, ax = plt.subplots(figsize=(10, 4))
         plot_tree(dt_cls_c2, feature_names=features_c2, class_names=list(dt_cls_c2.classes_), filled=True, ax=ax, fontsize=8)
         st.pyplot(fig)
+        plt.close(fig)
 
 # =========================================================================
 # VIEW 2: MODEL EVALUATIONS & METRICS
@@ -351,10 +375,6 @@ else:
             report = classification_report(y_test_class_c1, y_pred, target_names=['On-Time', 'Delayed'], output_dict=True, zero_division=0)
             st.dataframe(pd.DataFrame(report).transpose())
             st.markdown("---")
-            
-        with st.expander("🎲 View Random Unseen Test Samples (Code 1)"):
-            st.write("Here are a few randomly selected data points from the hold-out test set that were **not** used during training:")
-            st.dataframe(X_test_c1.sample(n=min(5, len(X_test_c1)), random_state=None))
 
     with tab2:
         st.subheader("Root Cause Diagnosis Performance Reports")
@@ -382,7 +402,3 @@ else:
             report = classification_report(y_test_class_c2, y_pred, output_dict=True, zero_division=0)
             st.dataframe(pd.DataFrame(report).transpose())
             st.markdown("---")
-            
-        with st.expander("🎲 View Random Unseen Test Samples (Code 2)"):
-            st.write("Here are a few randomly selected data points from the hold-out test set that were **not** used during training:")
-            st.dataframe(X_test_c2.sample(n=min(5, len(X_test_c2)), random_state=None))
