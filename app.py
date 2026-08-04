@@ -13,13 +13,15 @@ from sklearn.neural_network import MLPClassifier
 
 # Preprocessing & Metrics
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, label_binarize
 from sklearn.metrics import (
-    accuracy_score, 
-    classification_report, 
-    mean_squared_error, 
+    accuracy_score,
+    classification_report,
+    mean_squared_error,
     r2_score,
-    roc_auc_score
+    roc_auc_score,
+    roc_curve,
+    auc
 )
 
 # Page Layout Config
@@ -243,10 +245,12 @@ if app_mode == "Interactive Predictor & Diagnostics":
         ax.set_ylabel('Loss')
         st.pyplot(fig)
         plt.close(fig)
-            
+
+        # ---- FIXED: larger figure + fontsize so leaves don't overlap/cut off ----
         st.write("#### Decision Tree Diagram")
-        fig, ax = plt.subplots(figsize=(10, 4))
-        plot_tree(dt_cls_c1, feature_names=features_c1, class_names=['On-Time', 'Delayed'], filled=True, ax=ax, fontsize=8)
+        fig, ax = plt.subplots(figsize=(16, 8))
+        plot_tree(dt_cls_c1, feature_names=features_c1, class_names=['On-Time', 'Delayed'],
+                  filled=True, ax=ax, fontsize=9, rounded=True, precision=2)
         st.pyplot(fig)
         plt.close(fig)
 
@@ -330,10 +334,12 @@ if app_mode == "Interactive Predictor & Diagnostics":
         ax.set_ylabel('Loss')
         st.pyplot(fig)
         plt.close(fig)
-            
+
+        # ---- FIXED: larger figure + fontsize so leaves don't overlap/cut off ----
         st.write("#### Decision Tree Breakdown")
-        fig, ax = plt.subplots(figsize=(10, 4))
-        plot_tree(dt_cls_c2, feature_names=features_c2, class_names=list(dt_cls_c2.classes_), filled=True, ax=ax, fontsize=8)
+        fig, ax = plt.subplots(figsize=(18, 8))
+        plot_tree(dt_cls_c2, feature_names=features_c2, class_names=list(dt_cls_c2.classes_),
+                  filled=True, ax=ax, fontsize=9, rounded=True, precision=2)
         st.pyplot(fig)
         plt.close(fig)
 
@@ -366,7 +372,8 @@ else:
             st.write(f"#### {name}")
             y_pred = clf.predict(X_test_scaled_c1)
             acc = accuracy_score(y_test_class_c1, y_pred)
-            roc_auc = roc_auc_score(y_test_class_c1, clf.predict_proba(X_test_scaled_c1)[:, 1]) if hasattr(clf, "predict_proba") else float('nan')
+            has_proba = hasattr(clf, "predict_proba")
+            roc_auc = roc_auc_score(y_test_class_c1, clf.predict_proba(X_test_scaled_c1)[:, 1]) if has_proba else float('nan')
             
             sub_c1, sub_c2 = st.columns(2)
             sub_c1.metric("Accuracy", f"{acc:.4f}")
@@ -374,6 +381,21 @@ else:
             
             report = classification_report(y_test_class_c1, y_pred, target_names=['On-Time', 'Delayed'], output_dict=True, zero_division=0)
             st.dataframe(pd.DataFrame(report).transpose())
+
+            # ---- NEW: ROC-AUC curve for this classifier ----
+            if has_proba:
+                y_score = clf.predict_proba(X_test_scaled_c1)[:, 1]
+                fpr, tpr, _ = roc_curve(y_test_class_c1, y_score)
+                fig_roc, ax_roc = plt.subplots(figsize=(6, 4))
+                ax_roc.plot(fpr, tpr, color='darkorange', lw=2, label=f"AUC = {roc_auc:.3f}")
+                ax_roc.plot([0, 1], [0, 1], 'k--', lw=1, alpha=0.6, label="Chance")
+                ax_roc.set_xlabel("False Positive Rate")
+                ax_roc.set_ylabel("True Positive Rate")
+                ax_roc.set_title(f"ROC Curve: {name}")
+                ax_roc.legend(loc="lower right")
+                st.pyplot(fig_roc)
+                plt.close(fig_roc)
+
             st.markdown("---")
 
     with tab2:
@@ -392,13 +414,42 @@ else:
             "Random Forest": rf_cls_c2,
             "Neural Network (MLP)": nn_cls_c2
         }
+
+        # Multiclass ROC-AUC needs one-vs-rest binarized labels (3 root-cause classes)
+        all_classes_c2 = sorted(y_test_class_c2.unique())
+        y_test_bin_c2 = label_binarize(y_test_class_c2, classes=all_classes_c2)
         
         for name, clf in classifiers_c2.items():
             st.write(f"#### {name}")
             y_pred = clf.predict(X_test_scaled_c2)
             acc = accuracy_score(y_test_class_c2, y_pred)
-            
-            st.metric("Accuracy", f"{acc:.4f}")
+            has_proba = hasattr(clf, "predict_proba")
+
+            if has_proba:
+                proba = pd.DataFrame(clf.predict_proba(X_test_scaled_c2), columns=clf.classes_).reindex(columns=all_classes_c2).values
+                macro_auc = roc_auc_score(y_test_bin_c2, proba, average='macro', multi_class='ovr')
+            else:
+                macro_auc = float('nan')
+
+            sub_c1, sub_c2 = st.columns(2)
+            sub_c1.metric("Accuracy", f"{acc:.4f}")
+            sub_c2.metric("Macro ROC-AUC (OvR)", f"{macro_auc:.4f}")
+
             report = classification_report(y_test_class_c2, y_pred, output_dict=True, zero_division=0)
             st.dataframe(pd.DataFrame(report).transpose())
+
+            # ---- NEW: one-vs-rest ROC curves (one line per root-cause class) ----
+            if has_proba:
+                fig_roc, ax_roc = plt.subplots(figsize=(6, 4))
+                for i, cls in enumerate(all_classes_c2):
+                    fpr, tpr, _ = roc_curve(y_test_bin_c2[:, i], proba[:, i])
+                    ax_roc.plot(fpr, tpr, lw=2, label=f"{cls} (AUC={auc(fpr, tpr):.3f})")
+                ax_roc.plot([0, 1], [0, 1], 'k--', lw=1, alpha=0.6, label="Chance")
+                ax_roc.set_xlabel("False Positive Rate")
+                ax_roc.set_ylabel("True Positive Rate")
+                ax_roc.set_title(f"ROC Curves (One-vs-Rest): {name}")
+                ax_roc.legend(loc="lower right", fontsize=8)
+                st.pyplot(fig_roc)
+                plt.close(fig_roc)
+
             st.markdown("---")
