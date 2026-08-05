@@ -51,11 +51,10 @@ st.title("✈️ Flight Delay & Root Cause Analytics Dashboard")
 # SIDEBAR  (fixed 80/20 split on cloud so cache is never invalidated by slider)
 # =========================================================================
 st.sidebar.header("⚙️ Configuration Panel")
-st.sidebar.info("Cloud mode uses a **fixed 80/20 split** and a **12k-row sample** for fast loading.")
-train_pct = 80
-test_ratio = 0.20
-st.sidebar.markdown(f"**Split Ratio:** {train_pct}% Train / {100-train_pct}% Test (fixed)")
-st.sidebar.caption("Use the local / console script for custom train % on full data.")
+train_pct = st.sidebar.slider("Training Data Percentage (%)", 10, 90, 80, 5)
+test_ratio = (100.0 - train_pct) / 100.0
+st.sidebar.markdown(f"**Split:** {train_pct}% Train / {100-train_pct}% Test")
+st.sidebar.caption("Cloud uses 12k-row sample for speed. Full data = local/console.")
 
 app_mode = st.sidebar.selectbox(
     "Choose Dashboard View:",
@@ -92,11 +91,10 @@ def load_data():
 # FAST CORE TRAINING (always)  +  LAZY HEAVY TRAINING (only when needed)
 # =========================================================================
 @st.cache_resource(show_spinner="Training core models (fast)…")
-def train_core():
+def train_core(test_r: float):
     """Lightweight models only — finishes in a few seconds on 12k rows."""
     rng = np.random.RandomState(42)
-    test_r = 0.20
-
+    
     # --- CODE 1 ---
     df_c1 = df.copy()
     df_c1['Is_Severe_Delay'] = (df_c1['ArrDelay'] >= 45).astype(int)
@@ -280,7 +278,7 @@ except Exception as e:
     st.error(f"Error loading DelayedFlights.csv: {e}")
     st.stop()
 
-core = train_core()
+core = train_core(test_ratio)
 # unpack core into module-level names expected by the rest of the file
 X_test_c1 = core['X_test_c1']; y_test_class_c1 = core['y_test_class_c1']; y_test_reg_c1 = core['y_test_reg_c1']
 X_test_scaled_c1 = core['X_test_scaled_c1']; scaler_c1 = core['scaler_c1']; features_c1 = core['features_c1']
