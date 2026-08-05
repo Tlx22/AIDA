@@ -5,13 +5,15 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # Models
-from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge, Lasso
 from sklearn.tree import DecisionTreeClassifier, plot_tree
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
+from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
 from sklearn.neural_network import MLPClassifier
 from sklearn.svm import SVC
 from sklearn.decomposition import PCA
+from sklearn.naive_bayes import GaussianNB
+from sklearn.semi_supervised import LabelPropagation, SelfTrainingClassifier
 
 # Preprocessing & Metrics
 from sklearn.model_selection import train_test_split
@@ -35,6 +37,12 @@ try:
     MLXTEND_AVAILABLE = True
 except ImportError:
     MLXTEND_AVAILABLE = False
+
+try:
+    import lightgbm as lgb
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
 
 st.set_page_config(page_title="Flight Delay AI Dashboard", layout="wide")
 st.title("✈️ Flight Delay & Root Cause Analytics Dashboard")
@@ -179,6 +187,52 @@ def train_models(test_r):
     hier_cls_c2 = AgglomerativeClustering(n_clusters=3).fit(X_hier_sample_c2)
     hier_centroids_c2 = np.array([X_hier_sample_c2[hier_cls_c2.labels_ == i].mean(axis=0) for i in range(3)])
 
+
+    # ---- Extra models (NB, IsolationForest, LabelProp, SelfTrain, Ridge/Lasso, LGBM, DBSCAN) ----
+    nb_cls_c1 = GaussianNB().fit(X_train_scaled_c1, y_train_class_c1)
+    nb_cls_c2 = GaussianNB().fit(X_train_scaled_c2, y_train_class_c2)
+    iso_c1 = IsolationForest(n_estimators=80, contamination=0.3, random_state=42, n_jobs=-1).fit(X_train_scaled_c1)
+
+    LP_SAMPLE = 3000
+    lp_idx_c1 = rng.choice(len(X_train_scaled_c1), size=min(LP_SAMPLE, len(X_train_scaled_c1)), replace=False)
+    X_lp_c1 = X_train_scaled_c1[lp_idx_c1]
+    y_lp_c1 = y_train_class_c1.iloc[lp_idx_c1].values.copy()
+    mask_n = int(0.4 * len(y_lp_c1))
+    y_lp_c1[rng.choice(len(y_lp_c1), size=mask_n, replace=False)] = -1
+    lp_cls_c1 = LabelPropagation(kernel='rbf', max_iter=100).fit(X_lp_c1, y_lp_c1)
+
+    _rc_classes = sorted(y_train_class_c2.unique())
+    _rc_to_i = {c: i for i, c in enumerate(_rc_classes)}
+    _i_to_rc = {i: c for c, i in _rc_to_i.items()}
+    lp_idx_c2 = rng.choice(len(X_train_scaled_c2), size=min(LP_SAMPLE, len(X_train_scaled_c2)), replace=False)
+    X_lp_c2 = X_train_scaled_c2[lp_idx_c2]
+    y_lp_c2 = y_train_class_c2.iloc[lp_idx_c2].map(_rc_to_i).values.copy().astype(float)
+    mask_n2 = int(0.4 * len(y_lp_c2))
+    y_lp_c2[rng.choice(len(y_lp_c2), size=mask_n2, replace=False)] = -1
+    lp_cls_c2 = LabelPropagation(kernel='rbf', max_iter=100).fit(X_lp_c2, y_lp_c2)
+
+    st_cls_c1 = SelfTrainingClassifier(LogisticRegression(class_weight='balanced', max_iter=400), threshold=0.75, max_iter=8).fit(X_lp_c1, y_lp_c1)
+    st_cls_c2 = SelfTrainingClassifier(LogisticRegression(class_weight='balanced', max_iter=400), threshold=0.75, max_iter=8).fit(X_lp_c2, y_lp_c2)
+
+    ridge_c1 = Ridge(alpha=1.0).fit(X_train_scaled_c1, y_train_reg_c1)
+    lasso_c1 = Lasso(alpha=0.1, max_iter=1500).fit(X_train_scaled_c1, y_train_reg_c1)
+    ridge_c2 = Ridge(alpha=1.0).fit(X_train_scaled_c2, y_train_reg_c2)
+    lasso_c2 = Lasso(alpha=0.1, max_iter=1500).fit(X_train_scaled_c2, y_train_reg_c2)
+
+    if LIGHTGBM_AVAILABLE:
+        lgb_cls_c1 = lgb.LGBMClassifier(n_estimators=60, max_depth=5, class_weight='balanced', random_state=42, verbosity=-1).fit(X_train_scaled_c1, y_train_class_c1)
+        lgb_reg_c1 = lgb.LGBMRegressor(n_estimators=60, max_depth=5, random_state=42, verbosity=-1).fit(X_train_scaled_c1, y_train_reg_c1)
+        lgb_cls_c2 = lgb.LGBMClassifier(n_estimators=60, max_depth=5, class_weight='balanced', random_state=42, verbosity=-1).fit(X_train_scaled_c2, y_train_class_c2)
+        lgb_reg_c2 = lgb.LGBMRegressor(n_estimators=60, max_depth=5, random_state=42, verbosity=-1).fit(X_train_scaled_c2, y_train_reg_c2)
+    else:
+        lgb_cls_c1 = lgb_reg_c1 = lgb_cls_c2 = lgb_reg_c2 = None
+
+    DBSCAN_SAMPLE = 2000
+    db_idx_c1 = rng.choice(len(X_train_scaled_c1), size=min(DBSCAN_SAMPLE, len(X_train_scaled_c1)), replace=False)
+    dbscan_c1 = DBSCAN(eps=0.8, min_samples=12).fit(X_train_scaled_c1[db_idx_c1])
+    db_idx_c2 = rng.choice(len(X_train_scaled_c2), size=min(DBSCAN_SAMPLE, len(X_train_scaled_c2)), replace=False)
+    dbscan_c2 = DBSCAN(eps=0.8, min_samples=12).fit(X_train_scaled_c2[db_idx_c2])
+
     return (
         (X_test_c1, y_test_class_c1, y_test_reg_c1, X_test_scaled_c1, scaler_c1, features_c1,
          lin_reg_c1, log_reg_c1, dt_cls_c1, rf_cls_c1, kmeans_c1, nn_cls_c1),
@@ -186,11 +240,15 @@ def train_models(test_r):
          lin_reg_c2, log_reg_c2, dt_cls_c2, rf_cls_c2, kmeans_c2, nn_cls_c2),
         (pca_c1, X_test_pca_c1, log_reg_pca_c1, svm_cls_c1, hier_cls_c1, X_hier_sample_c1, hier_centroids_c1),
         (pca_c2, X_test_pca_c2, log_reg_pca_c2, svm_cls_c2, hier_cls_c2, X_hier_sample_c2, hier_centroids_c2),
-        df_clean_c1
+        df_clean_c1,
+        (nb_cls_c1, nb_cls_c2, iso_c1, lp_cls_c1, lp_cls_c2, st_cls_c1, st_cls_c2,
+         ridge_c1, lasso_c1, ridge_c2, lasso_c2,
+         lgb_cls_c1, lgb_reg_c1, lgb_cls_c2, lgb_reg_c2,
+         dbscan_c1, dbscan_c2, _i_to_rc)
     )
 
-with st.spinner("Training models (incl. PCA, SVM, Hierarchical)... Please wait."):
-    c1_bundle, c2_bundle, extra_c1, extra_c2, df_clean_c1 = train_models(test_ratio)
+with st.spinner("Training models (incl. PCA, SVM, Hierarchical, NB, LightGBM...)... Please wait."):
+    c1_bundle, c2_bundle, extra_c1, extra_c2, df_clean_c1, extra_models = train_models(test_ratio)
 
 (X_test_c1, y_test_class_c1, y_test_reg_c1, X_test_scaled_c1, scaler_c1, features_c1,
  lin_reg_c1, log_reg_c1, dt_cls_c1, rf_cls_c1, kmeans_c1, nn_cls_c1) = c1_bundle
@@ -198,6 +256,10 @@ with st.spinner("Training models (incl. PCA, SVM, Hierarchical)... Please wait."
  lin_reg_c2, log_reg_c2, dt_cls_c2, rf_cls_c2, kmeans_c2, nn_cls_c2) = c2_bundle
 (pca_c1, X_test_pca_c1, log_reg_pca_c1, svm_cls_c1, hier_cls_c1, X_hier_sample_c1, hier_centroids_c1) = extra_c1
 (pca_c2, X_test_pca_c2, log_reg_pca_c2, svm_cls_c2, hier_cls_c2, X_hier_sample_c2, hier_centroids_c2) = extra_c2
+(nb_cls_c1, nb_cls_c2, iso_c1, lp_cls_c1, lp_cls_c2, st_cls_c1, st_cls_c2,
+ ridge_c1, lasso_c1, ridge_c2, lasso_c2,
+ lgb_cls_c1, lgb_reg_c1, lgb_cls_c2, lgb_reg_c2,
+ dbscan_c1, dbscan_c2, _i_to_rc) = extra_models
 
 # =========================================================================
 # CORRELATION MATRIX
@@ -258,6 +320,20 @@ elif app_mode == "Interactive Predictor & Diagnostics":
         e2.metric("SVM (RBF)", "DELAYED ⚠️" if svm_cls_c1.predict(input_scaled)[0] == 1 else "ON-TIME 🟢")
         hier_pred = int(np.argmin(np.linalg.norm(hier_centroids_c1 - input_scaled, axis=1)))
         e3.metric("Hierarchical Cluster", f"Group #{hier_pred}")
+
+        st.markdown("##### More Models")
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Naive Bayes", "DELAYED ⚠️" if nb_cls_c1.predict(input_scaled)[0] == 1 else "ON-TIME 🟢")
+        f2.metric("Isolation Forest", "ANOMALY ⚠️" if iso_c1.predict(input_scaled)[0] == -1 else "NORMAL 🟢")
+        f3.metric("Label Propagation", "DELAYED ⚠️" if lp_cls_c1.predict(input_scaled)[0] == 1 else "ON-TIME 🟢")
+        f4.metric("Self-Training", "DELAYED ⚠️" if st_cls_c1.predict(input_scaled)[0] == 1 else "ON-TIME 🟢")
+        g1, g2, g3 = st.columns(3)
+        g1.metric("Ridge (mins)", f"{ridge_c1.predict(input_scaled)[0]:.1f}")
+        g2.metric("Lasso (mins)", f"{lasso_c1.predict(input_scaled)[0]:.1f}")
+        if LIGHTGBM_AVAILABLE and lgb_cls_c1 is not None:
+            g3.metric("LightGBM", "DELAYED ⚠️" if lgb_cls_c1.predict(input_scaled)[0] == 1 else "ON-TIME 🟢")
+        else:
+            g3.metric("LightGBM", "not installed")
 
         st.markdown("---")
         st.subheader("📊 Comprehensive Model Visualizations & Insights")
@@ -339,6 +415,21 @@ elif app_mode == "Interactive Predictor & Diagnostics":
         hier_pred = int(np.argmin(np.linalg.norm(hier_centroids_c2 - input_scaled, axis=1)))
         e3.metric("Hierarchical Cluster", f"Group #{hier_pred}")
 
+        st.markdown("##### More Models")
+        f1, f2, f3 = st.columns(3)
+        f1.metric("Naive Bayes", str(nb_cls_c2.predict(input_scaled)[0]))
+        lp_i = int(lp_cls_c2.predict(input_scaled)[0])
+        f2.metric("Label Propagation", str(_i_to_rc.get(lp_i, lp_i)))
+        st_i = int(st_cls_c2.predict(input_scaled)[0])
+        f3.metric("Self-Training", str(_i_to_rc.get(st_i, st_i)))
+        g1, g2, g3 = st.columns(3)
+        g1.metric("Ridge (Carrier mins)", f"{ridge_c2.predict(input_scaled)[0]:.1f}")
+        g2.metric("Lasso (Carrier mins)", f"{lasso_c2.predict(input_scaled)[0]:.1f}")
+        if LIGHTGBM_AVAILABLE and lgb_cls_c2 is not None:
+            g3.metric("LightGBM", str(lgb_cls_c2.predict(input_scaled)[0]))
+        else:
+            g3.metric("LightGBM", "not installed")
+
         st.markdown("---")
         st.subheader("📊 Comprehensive Diagnostic Visualizations & Insights")
         v_col1, v_col2 = st.columns(2)
@@ -403,8 +494,12 @@ elif app_mode == "Model Evaluations & Metrics":
             "Decision Tree": dt_cls_c1,
             "Random Forest": rf_cls_c1,
             "Neural Network (MLP)": nn_cls_c1,
-            "SVM (RBF)": svm_cls_c1
+            "SVM (RBF)": svm_cls_c1,
+            "Naive Bayes": nb_cls_c1,
+            "Self-Training": st_cls_c1,
         }
+        if LIGHTGBM_AVAILABLE and lgb_cls_c1 is not None:
+            classifiers_c1["LightGBM"] = lgb_cls_c1
         for name, clf in classifiers_c1.items():
             st.write(f"#### {name}")
             y_pred = clf.predict(X_test_scaled_c1)
@@ -445,8 +540,11 @@ elif app_mode == "Model Evaluations & Metrics":
             "Decision Tree": dt_cls_c2,
             "Random Forest": rf_cls_c2,
             "Neural Network (MLP)": nn_cls_c2,
-            "SVM (RBF)": svm_cls_c2
+            "SVM (RBF)": svm_cls_c2,
+            "Naive Bayes": nb_cls_c2,
         }
+        if LIGHTGBM_AVAILABLE and lgb_cls_c2 is not None:
+            classifiers_c2["LightGBM"] = lgb_cls_c2
         all_classes_c2 = sorted(y_test_class_c2.unique())
         y_test_bin_c2 = label_binarize(y_test_class_c2, classes=all_classes_c2)
 
