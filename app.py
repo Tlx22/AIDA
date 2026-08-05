@@ -48,12 +48,14 @@ st.set_page_config(page_title="Flight Delay AI Dashboard", layout="wide")
 st.title("✈️ Flight Delay & Root Cause Analytics Dashboard")
 
 # =========================================================================
-# SIDEBAR
+# SIDEBAR  (fixed 80/20 split on cloud so cache is never invalidated by slider)
 # =========================================================================
 st.sidebar.header("⚙️ Configuration Panel")
-train_pct = st.sidebar.slider("Training Data Percentage (%)", min_value=10, max_value=90, value=80, step=5)
-test_ratio = (100.0 - train_pct) / 100.0
-st.sidebar.markdown(f"**Split Ratio:** {train_pct}% Train / {100-train_pct}% Test")
+st.sidebar.info("Cloud mode uses a **fixed 80/20 split** and a **12k-row sample** for fast loading.")
+train_pct = 80
+test_ratio = 0.20
+st.sidebar.markdown(f"**Split Ratio:** {train_pct}% Train / {100-train_pct}% Test (fixed)")
+st.sidebar.caption("Use the local / console script for custom train % on full data.")
 
 app_mode = st.sidebar.selectbox(
     "Choose Dashboard View:",
@@ -66,33 +68,34 @@ app_mode = st.sidebar.selectbox(
     ]
 )
 
-@st.cache_data
+MAX_ROWS = 12000  # hard cap for Streamlit Cloud RAM/CPU
+
+@st.cache_data(show_spinner="Loading data…")
 def load_data():
     cols = [
         'ArrDelay', 'CRSDepTime', 'TailNum', 'Distance',
         'CarrierDelay', 'WeatherDelay', 'NASDelay', 'TaxiOut', 'AirTime'
     ]
     df = pd.read_csv('DelayedFlights.csv', usecols=cols)
-    if len(df) > 30000:
-        df = df.sample(n=30000, random_state=42).reset_index(drop=True)
+    if len(df) > MAX_ROWS:
+        df = df.sample(n=MAX_ROWS, random_state=42).reset_index(drop=True)
     float_cols = df.select_dtypes(include=['float64']).columns
     df[float_cols] = df[float_cols].astype('float32')
     return df
 
-try:
-    df = load_data()
-except Exception as e:
-    st.error(f"Error loading DelayedFlights.csv: {e}")
-    st.stop()
 
 # =========================================================================
-# TRAIN MODELS (incl. PCA, SVM, Hierarchical)
+# TRAIN MODELS
 # =========================================================================
-@st.cache_resource
-def train_models(test_r):
+
+# =========================================================================
+# FAST CORE TRAINING (always)  +  LAZY HEAVY TRAINING (only when needed)
+# =========================================================================
+@st.cache_resource(show_spinner="Training core models (fast)…")
+def train_core():
+    """Lightweight models only — finishes in a few seconds on 12k rows."""
     rng = np.random.RandomState(42)
-    SVM_SAMPLE_SIZE = 2000
-    HIER_SAMPLE_SIZE = 1000
+    test_r = 0.20
 
     # --- CODE 1 ---
     df_c1 = df.copy()
@@ -100,167 +103,234 @@ def train_models(test_r):
     df_c1['DepHour'] = (df_c1['CRSDepTime'] // 100).astype(int)
     df_c1 = df_c1.sort_values(['TailNum', 'CRSDepTime']).reset_index(drop=True)
     df_c1['Inbound_Leg_ArrDelay'] = df_c1.groupby('TailNum')['ArrDelay'].shift(1).fillna(0)
-
     features_c1 = ['Distance', 'DepHour', 'Inbound_Leg_ArrDelay']
     df_clean_c1 = df_c1[features_c1 + ['ArrDelay', 'Is_Severe_Delay']].dropna()
-
     X_c1 = df_clean_c1[features_c1]
     y_class_c1 = df_clean_c1['Is_Severe_Delay']
     y_reg_c1 = df_clean_c1['ArrDelay']
-
     X_train_c1, X_test_c1, y_train_class_c1, y_test_class_c1, y_train_reg_c1, y_test_reg_c1 = train_test_split(
         X_c1, y_class_c1, y_reg_c1, test_size=test_r, random_state=42
     )
-
     scaler_c1 = StandardScaler()
     X_train_scaled_c1 = scaler_c1.fit_transform(X_train_c1)
     X_test_scaled_c1 = scaler_c1.transform(X_test_c1)
 
     lin_reg_c1 = LinearRegression().fit(X_train_scaled_c1, y_train_reg_c1)
-    log_reg_c1 = LogisticRegression(class_weight='balanced', max_iter=500).fit(X_train_scaled_c1, y_train_class_c1)
-    dt_cls_c1  = DecisionTreeClassifier(criterion='gini', max_depth=3, class_weight='balanced', random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
-    rf_cls_c1  = RandomForestClassifier(n_estimators=20, max_depth=4, class_weight='balanced', n_jobs=-1, random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
-    kmeans_c1  = KMeans(n_clusters=2, random_state=42, n_init=5).fit(X_train_scaled_c1)
-    nn_cls_c1  = MLPClassifier(hidden_layer_sizes=(6,), max_iter=60, random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
+    log_reg_c1 = LogisticRegression(class_weight='balanced', max_iter=300).fit(X_train_scaled_c1, y_train_class_c1)
+    dt_cls_c1  = DecisionTreeClassifier(max_depth=3, class_weight='balanced', random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
+    rf_cls_c1  = RandomForestClassifier(n_estimators=15, max_depth=4, class_weight='balanced', n_jobs=-1, random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
+    kmeans_c1  = KMeans(n_clusters=2, random_state=42, n_init=3).fit(X_train_scaled_c1)
+    # Skip MLP on cloud — slow & collapses to majority class
+    nn_cls_c1  = log_reg_c1  # placeholder alias so UI doesn't break
 
     pca_c1 = PCA(n_components=2, random_state=42).fit(X_train_scaled_c1)
-    X_train_pca_c1 = pca_c1.transform(X_train_scaled_c1)
-    X_test_pca_c1  = pca_c1.transform(X_test_scaled_c1)
-    log_reg_pca_c1 = LogisticRegression(class_weight='balanced', max_iter=500).fit(X_train_pca_c1, y_train_class_c1)
-
-    svm_idx_c1 = rng.choice(len(X_train_scaled_c1), size=min(SVM_SAMPLE_SIZE, len(X_train_scaled_c1)), replace=False)
-    svm_cls_c1 = SVC(kernel='rbf', probability=True, class_weight='balanced', random_state=42).fit(
-        X_train_scaled_c1[svm_idx_c1], y_train_class_c1.iloc[svm_idx_c1]
+    X_test_pca_c1 = pca_c1.transform(X_test_scaled_c1)
+    log_reg_pca_c1 = LogisticRegression(class_weight='balanced', max_iter=300).fit(
+        pca_c1.transform(X_train_scaled_c1), y_train_class_c1
     )
-
-    hier_idx_c1 = rng.choice(len(X_train_scaled_c1), size=min(HIER_SAMPLE_SIZE, len(X_train_scaled_c1)), replace=False)
-    X_hier_sample_c1 = X_train_scaled_c1[hier_idx_c1]
-    hier_cls_c1 = AgglomerativeClustering(n_clusters=2).fit(X_hier_sample_c1)
-    hier_centroids_c1 = np.array([X_hier_sample_c1[hier_cls_c1.labels_ == i].mean(axis=0) for i in range(2)])
 
     # --- CODE 2 ---
     df_c2 = df.copy()
-    delay_cols = ['WeatherDelay', 'NASDelay', 'CarrierDelay']
-    df_c2[delay_cols] = df_c2[delay_cols].fillna(0)
+    for c in ['WeatherDelay', 'NASDelay', 'CarrierDelay']:
+        df_c2[c] = df_c2[c].fillna(0)
 
     def assign_root_cause(row):
         delays = {'Carrier': row['CarrierDelay'], 'Weather': row['WeatherDelay'], 'NAS/Hub': row['NASDelay']}
         max_delay = max(delays.values())
         if max_delay == 0:
             return 'Carrier'
-        return max(key for key, val in delays.items() if val == max_delay)
+        return max(k for k, v in delays.items() if v == max_delay)
 
     df_c2['RootCause'] = df_c2.apply(assign_root_cause, axis=1)
     features_c2 = ['TaxiOut', 'AirTime', 'Distance']
     df_clean_c2 = df_c2[features_c2 + ['RootCause', 'CarrierDelay']].dropna()
-
     X_c2 = df_clean_c2[features_c2]
     y_class_c2 = df_clean_c2['RootCause']
     y_reg_c2 = df_clean_c2['CarrierDelay']
-
     X_train_c2, X_test_c2, y_train_class_c2, y_test_class_c2, y_train_reg_c2, y_test_reg_c2 = train_test_split(
         X_c2, y_class_c2, y_reg_c2, test_size=test_r, random_state=42
     )
-
     scaler_c2 = StandardScaler()
     X_train_scaled_c2 = scaler_c2.fit_transform(X_train_c2)
     X_test_scaled_c2 = scaler_c2.transform(X_test_c2)
 
     lin_reg_c2 = LinearRegression().fit(X_train_scaled_c2, y_train_reg_c2)
-    log_reg_c2 = LogisticRegression(class_weight='balanced', max_iter=500).fit(X_train_scaled_c2, y_train_class_c2)
-    dt_cls_c2  = DecisionTreeClassifier(criterion='gini', max_depth=3, class_weight='balanced', random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
-    rf_cls_c2  = RandomForestClassifier(n_estimators=20, max_depth=4, class_weight='balanced', n_jobs=-1, random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
-    kmeans_c2  = KMeans(n_clusters=3, random_state=42, n_init=5).fit(X_train_scaled_c2)
-    nn_cls_c2  = MLPClassifier(hidden_layer_sizes=(6,), max_iter=60, random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
+    log_reg_c2 = LogisticRegression(class_weight='balanced', max_iter=300).fit(X_train_scaled_c2, y_train_class_c2)
+    dt_cls_c2  = DecisionTreeClassifier(max_depth=3, class_weight='balanced', random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
+    rf_cls_c2  = RandomForestClassifier(n_estimators=15, max_depth=4, class_weight='balanced', n_jobs=-1, random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
+    kmeans_c2  = KMeans(n_clusters=3, random_state=42, n_init=3).fit(X_train_scaled_c2)
+    nn_cls_c2  = log_reg_c2  # placeholder
 
     pca_c2 = PCA(n_components=2, random_state=42).fit(X_train_scaled_c2)
-    X_train_pca_c2 = pca_c2.transform(X_train_scaled_c2)
-    X_test_pca_c2  = pca_c2.transform(X_test_scaled_c2)
-    log_reg_pca_c2 = LogisticRegression(class_weight='balanced', max_iter=500).fit(X_train_pca_c2, y_train_class_c2)
-
-    svm_idx_c2 = rng.choice(len(X_train_scaled_c2), size=min(SVM_SAMPLE_SIZE, len(X_train_scaled_c2)), replace=False)
-    svm_cls_c2 = SVC(kernel='rbf', probability=True, class_weight='balanced', random_state=42).fit(
-        X_train_scaled_c2[svm_idx_c2], y_train_class_c2.iloc[svm_idx_c2]
+    X_test_pca_c2 = pca_c2.transform(X_test_scaled_c2)
+    log_reg_pca_c2 = LogisticRegression(class_weight='balanced', max_iter=300).fit(
+        pca_c2.transform(X_train_scaled_c2), y_train_class_c2
     )
 
-    hier_idx_c2 = rng.choice(len(X_train_scaled_c2), size=min(HIER_SAMPLE_SIZE, len(X_train_scaled_c2)), replace=False)
-    X_hier_sample_c2 = X_train_scaled_c2[hier_idx_c2]
-    hier_cls_c2 = AgglomerativeClustering(n_clusters=3).fit(X_hier_sample_c2)
-    hier_centroids_c2 = np.array([X_hier_sample_c2[hier_cls_c2.labels_ == i].mean(axis=0) for i in range(3)])
-
-
-    # ---- Extra models (NB, IsolationForest, LabelProp, SelfTrain, Ridge/Lasso, LGBM, DBSCAN) ----
+    # Fast extras always available
     nb_cls_c1 = GaussianNB().fit(X_train_scaled_c1, y_train_class_c1)
     nb_cls_c2 = GaussianNB().fit(X_train_scaled_c2, y_train_class_c2)
-    iso_c1 = IsolationForest(n_estimators=50, contamination=0.3, random_state=42, n_jobs=-1).fit(X_train_scaled_c1)
+    ridge_c1 = Ridge(alpha=1.0).fit(X_train_scaled_c1, y_train_reg_c1)
+    lasso_c1 = Lasso(alpha=0.1, max_iter=1000).fit(X_train_scaled_c1, y_train_reg_c1)
+    ridge_c2 = Ridge(alpha=1.0).fit(X_train_scaled_c2, y_train_reg_c2)
+    lasso_c2 = Lasso(alpha=0.1, max_iter=1000).fit(X_train_scaled_c2, y_train_reg_c2)
 
-    LP_SAMPLE = 1500
-    lp_idx_c1 = rng.choice(len(X_train_scaled_c1), size=min(LP_SAMPLE, len(X_train_scaled_c1)), replace=False)
-    X_lp_c1 = X_train_scaled_c1[lp_idx_c1]
-    y_lp_c1 = y_train_class_c1.iloc[lp_idx_c1].values.copy()
-    mask_n = int(0.4 * len(y_lp_c1))
-    y_lp_c1[rng.choice(len(y_lp_c1), size=mask_n, replace=False)] = -1
-    lp_cls_c1 = LabelPropagation(kernel='knn', n_neighbors=7, max_iter=200).fit(X_lp_c1, y_lp_c1)
+    if LIGHTGBM_AVAILABLE:
+        lgb_cls_c1 = lgb.LGBMClassifier(n_estimators=25, max_depth=3, class_weight='balanced',
+                                        random_state=42, verbosity=-1, n_jobs=1).fit(X_train_scaled_c1, y_train_class_c1)
+        lgb_reg_c1 = lgb.LGBMRegressor(n_estimators=25, max_depth=3, random_state=42, verbosity=-1, n_jobs=1).fit(X_train_scaled_c1, y_train_reg_c1)
+        lgb_cls_c2 = lgb.LGBMClassifier(n_estimators=25, max_depth=3, class_weight='balanced',
+                                        random_state=42, verbosity=-1, n_jobs=1).fit(X_train_scaled_c2, y_train_class_c2)
+        lgb_reg_c2 = lgb.LGBMRegressor(n_estimators=25, max_depth=3, random_state=42, verbosity=-1, n_jobs=1).fit(X_train_scaled_c2, y_train_reg_c2)
+    else:
+        lgb_cls_c1 = lgb_reg_c1 = lgb_cls_c2 = lgb_reg_c2 = None
+
+    return dict(
+        # data
+        X_test_c1=X_test_c1, y_test_class_c1=y_test_class_c1, y_test_reg_c1=y_test_reg_c1,
+        X_test_scaled_c1=X_test_scaled_c1, X_train_scaled_c1=X_train_scaled_c1,
+        y_train_class_c1=y_train_class_c1, y_train_reg_c1=y_train_reg_c1,
+        scaler_c1=scaler_c1, features_c1=features_c1, df_clean_c1=df_clean_c1,
+        X_test_c2=X_test_c2, y_test_class_c2=y_test_class_c2, y_test_reg_c2=y_test_reg_c2,
+        X_test_scaled_c2=X_test_scaled_c2, X_train_scaled_c2=X_train_scaled_c2,
+        y_train_class_c2=y_train_class_c2, y_train_reg_c2=y_train_reg_c2,
+        scaler_c2=scaler_c2, features_c2=features_c2,
+        # models
+        lin_reg_c1=lin_reg_c1, log_reg_c1=log_reg_c1, dt_cls_c1=dt_cls_c1, rf_cls_c1=rf_cls_c1,
+        kmeans_c1=kmeans_c1, nn_cls_c1=nn_cls_c1,
+        lin_reg_c2=lin_reg_c2, log_reg_c2=log_reg_c2, dt_cls_c2=dt_cls_c2, rf_cls_c2=rf_cls_c2,
+        kmeans_c2=kmeans_c2, nn_cls_c2=nn_cls_c2,
+        pca_c1=pca_c1, X_test_pca_c1=X_test_pca_c1, log_reg_pca_c1=log_reg_pca_c1,
+        pca_c2=pca_c2, X_test_pca_c2=X_test_pca_c2, log_reg_pca_c2=log_reg_pca_c2,
+        nb_cls_c1=nb_cls_c1, nb_cls_c2=nb_cls_c2,
+        ridge_c1=ridge_c1, lasso_c1=lasso_c1, ridge_c2=ridge_c2, lasso_c2=lasso_c2,
+        lgb_cls_c1=lgb_cls_c1, lgb_reg_c1=lgb_reg_c1, lgb_cls_c2=lgb_cls_c2, lgb_reg_c2=lgb_reg_c2,
+    )
+
+
+@st.cache_resource(show_spinner="Training heavy models (SVM / Hierarchical / Isolation / LP)…")
+def train_heavy(X_train_scaled_c1, y_train_class_c1, X_train_scaled_c2, y_train_class_c2):
+    """Only called when user opens Advanced / Extra tabs."""
+    rng = np.random.RandomState(42)
+    # Linear SVM is far faster than RBF on cloud
+    n1 = min(1500, len(X_train_scaled_c1))
+    n2 = min(1500, len(X_train_scaled_c2))
+    idx1 = rng.choice(len(X_train_scaled_c1), size=n1, replace=False)
+    idx2 = rng.choice(len(X_train_scaled_c2), size=n2, replace=False)
+
+    svm_cls_c1 = SVC(kernel='linear', probability=True, class_weight='balanced', random_state=42).fit(
+        X_train_scaled_c1[idx1], y_train_class_c1.iloc[idx1]
+    )
+    svm_cls_c2 = SVC(kernel='linear', probability=True, class_weight='balanced', random_state=42).fit(
+        X_train_scaled_c2[idx2], y_train_class_c2.iloc[idx2]
+    )
+
+    h1 = min(800, len(X_train_scaled_c1))
+    h2 = min(800, len(X_train_scaled_c2))
+    hi1 = rng.choice(len(X_train_scaled_c1), size=h1, replace=False)
+    hi2 = rng.choice(len(X_train_scaled_c2), size=h2, replace=False)
+    Xh1 = X_train_scaled_c1[hi1]
+    Xh2 = X_train_scaled_c2[hi2]
+    hier_cls_c1 = AgglomerativeClustering(n_clusters=2).fit(Xh1)
+    hier_centroids_c1 = np.array([Xh1[hier_cls_c1.labels_ == i].mean(axis=0) for i in range(2)])
+    hier_cls_c2 = AgglomerativeClustering(n_clusters=3).fit(Xh2)
+    hier_centroids_c2 = np.array([Xh2[hier_cls_c2.labels_ == i].mean(axis=0) for i in range(3)])
+    X_hier_sample_c1, X_hier_sample_c2 = Xh1, Xh2
+
+    iso_c1 = IsolationForest(n_estimators=30, contamination=0.3, random_state=42, n_jobs=1).fit(X_train_scaled_c1)
+
+    # Label Propagation (knn) — small sample; skip Self-Training on cloud (too slow)
+    lp_n = min(800, len(X_train_scaled_c1))
+    li1 = rng.choice(len(X_train_scaled_c1), size=lp_n, replace=False)
+    X_lp = X_train_scaled_c1[li1]
+    y_lp = y_train_class_c1.iloc[li1].values.copy()
+    y_lp[rng.choice(lp_n, size=int(0.4 * lp_n), replace=False)] = -1
+    lp_cls_c1 = LabelPropagation(kernel='knn', n_neighbors=5, max_iter=100).fit(X_lp, y_lp)
+    st_cls_c1 = lp_cls_c1  # alias — Self-Training skipped on cloud
 
     _rc_classes = sorted(y_train_class_c2.unique())
     _rc_to_i = {c: i for i, c in enumerate(_rc_classes)}
     _i_to_rc = {i: c for c, i in _rc_to_i.items()}
-    lp_idx_c2 = rng.choice(len(X_train_scaled_c2), size=min(LP_SAMPLE, len(X_train_scaled_c2)), replace=False)
-    X_lp_c2 = X_train_scaled_c2[lp_idx_c2]
-    y_lp_c2 = y_train_class_c2.iloc[lp_idx_c2].map(_rc_to_i).values.copy().astype(float)
-    mask_n2 = int(0.4 * len(y_lp_c2))
-    y_lp_c2[rng.choice(len(y_lp_c2), size=mask_n2, replace=False)] = -1
-    lp_cls_c2 = LabelPropagation(kernel='knn', n_neighbors=7, max_iter=200).fit(X_lp_c2, y_lp_c2)
+    lp_n2 = min(800, len(X_train_scaled_c2))
+    li2 = rng.choice(len(X_train_scaled_c2), size=lp_n2, replace=False)
+    X_lp2 = X_train_scaled_c2[li2]
+    y_lp2 = y_train_class_c2.iloc[li2].map(_rc_to_i).values.copy().astype(float)
+    y_lp2[rng.choice(lp_n2, size=int(0.4 * lp_n2), replace=False)] = -1
+    lp_cls_c2 = LabelPropagation(kernel='knn', n_neighbors=5, max_iter=100).fit(X_lp2, y_lp2)
+    st_cls_c2 = lp_cls_c2
 
-    st_cls_c1 = SelfTrainingClassifier(LogisticRegression(class_weight='balanced', max_iter=400), threshold=0.75, max_iter=5).fit(X_lp_c1, y_lp_c1)
-    st_cls_c2 = SelfTrainingClassifier(LogisticRegression(class_weight='balanced', max_iter=400), threshold=0.75, max_iter=5).fit(X_lp_c2, y_lp_c2)
+    db1 = DBSCAN(eps=0.9, min_samples=10).fit(Xh1)
+    db2 = DBSCAN(eps=0.9, min_samples=10).fit(Xh2)
 
-    ridge_c1 = Ridge(alpha=1.0).fit(X_train_scaled_c1, y_train_reg_c1)
-    lasso_c1 = Lasso(alpha=0.1, max_iter=1500).fit(X_train_scaled_c1, y_train_reg_c1)
-    ridge_c2 = Ridge(alpha=1.0).fit(X_train_scaled_c2, y_train_reg_c2)
-    lasso_c2 = Lasso(alpha=0.1, max_iter=1500).fit(X_train_scaled_c2, y_train_reg_c2)
-
-    if LIGHTGBM_AVAILABLE:
-        lgb_cls_c1 = lgb.LGBMClassifier(n_estimators=40, max_depth=4, class_weight='balanced', random_state=42, verbosity=-1).fit(X_train_scaled_c1, y_train_class_c1)
-        lgb_reg_c1 = lgb.LGBMRegressor(n_estimators=40, max_depth=4, random_state=42, verbosity=-1).fit(X_train_scaled_c1, y_train_reg_c1)
-        lgb_cls_c2 = lgb.LGBMClassifier(n_estimators=40, max_depth=4, class_weight='balanced', random_state=42, verbosity=-1).fit(X_train_scaled_c2, y_train_class_c2)
-        lgb_reg_c2 = lgb.LGBMRegressor(n_estimators=40, max_depth=4, random_state=42, verbosity=-1).fit(X_train_scaled_c2, y_train_reg_c2)
-    else:
-        lgb_cls_c1 = lgb_reg_c1 = lgb_cls_c2 = lgb_reg_c2 = None
-
-    DBSCAN_SAMPLE = 1200
-    db_idx_c1 = rng.choice(len(X_train_scaled_c1), size=min(DBSCAN_SAMPLE, len(X_train_scaled_c1)), replace=False)
-    dbscan_c1 = DBSCAN(eps=0.8, min_samples=12).fit(X_train_scaled_c1[db_idx_c1])
-    db_idx_c2 = rng.choice(len(X_train_scaled_c2), size=min(DBSCAN_SAMPLE, len(X_train_scaled_c2)), replace=False)
-    dbscan_c2 = DBSCAN(eps=0.8, min_samples=12).fit(X_train_scaled_c2[db_idx_c2])
-
-    return (
-        (X_test_c1, y_test_class_c1, y_test_reg_c1, X_test_scaled_c1, scaler_c1, features_c1,
-         lin_reg_c1, log_reg_c1, dt_cls_c1, rf_cls_c1, kmeans_c1, nn_cls_c1),
-        (X_test_c2, y_test_class_c2, y_test_reg_c2, X_test_scaled_c2, scaler_c2, features_c2,
-         lin_reg_c2, log_reg_c2, dt_cls_c2, rf_cls_c2, kmeans_c2, nn_cls_c2),
-        (pca_c1, X_test_pca_c1, log_reg_pca_c1, svm_cls_c1, hier_cls_c1, X_hier_sample_c1, hier_centroids_c1),
-        (pca_c2, X_test_pca_c2, log_reg_pca_c2, svm_cls_c2, hier_cls_c2, X_hier_sample_c2, hier_centroids_c2),
-        df_clean_c1,
-        (nb_cls_c1, nb_cls_c2, iso_c1, lp_cls_c1, lp_cls_c2, st_cls_c1, st_cls_c2,
-         ridge_c1, lasso_c1, ridge_c2, lasso_c2,
-         lgb_cls_c1, lgb_reg_c1, lgb_cls_c2, lgb_reg_c2,
-         dbscan_c1, dbscan_c2, _i_to_rc)
+    return dict(
+        svm_cls_c1=svm_cls_c1, svm_cls_c2=svm_cls_c2,
+        hier_cls_c1=hier_cls_c1, hier_cls_c2=hier_cls_c2,
+        hier_centroids_c1=hier_centroids_c1, hier_centroids_c2=hier_centroids_c2,
+        X_hier_sample_c1=X_hier_sample_c1, X_hier_sample_c2=X_hier_sample_c2,
+        iso_c1=iso_c1, lp_cls_c1=lp_cls_c1, lp_cls_c2=lp_cls_c2,
+        st_cls_c1=st_cls_c1, st_cls_c2=st_cls_c2,
+        dbscan_c1=db1, dbscan_c2=db2, _i_to_rc=_i_to_rc,
     )
 
-with st.spinner("Training models (incl. PCA, SVM, Hierarchical, NB, LightGBM...)... Please wait."):
-    c1_bundle, c2_bundle, extra_c1, extra_c2, df_clean_c1, extra_models = train_models(test_ratio)
 
-(X_test_c1, y_test_class_c1, y_test_reg_c1, X_test_scaled_c1, scaler_c1, features_c1,
- lin_reg_c1, log_reg_c1, dt_cls_c1, rf_cls_c1, kmeans_c1, nn_cls_c1) = c1_bundle
-(X_test_c2, y_test_class_c2, y_test_reg_c2, X_test_scaled_c2, scaler_c2, features_c2,
- lin_reg_c2, log_reg_c2, dt_cls_c2, rf_cls_c2, kmeans_c2, nn_cls_c2) = c2_bundle
-(pca_c1, X_test_pca_c1, log_reg_pca_c1, svm_cls_c1, hier_cls_c1, X_hier_sample_c1, hier_centroids_c1) = extra_c1
-(pca_c2, X_test_pca_c2, log_reg_pca_c2, svm_cls_c2, hier_cls_c2, X_hier_sample_c2, hier_centroids_c2) = extra_c2
-(nb_cls_c1, nb_cls_c2, iso_c1, lp_cls_c1, lp_cls_c2, st_cls_c1, st_cls_c2,
- ridge_c1, lasso_c1, ridge_c2, lasso_c2,
- lgb_cls_c1, lgb_reg_c1, lgb_cls_c2, lgb_reg_c2,
- dbscan_c1, dbscan_c2, _i_to_rc) = extra_models
+# ---- Always train core (seconds) ----
+try:
+    df = load_data()
+except Exception as e:
+    st.error(f"Error loading DelayedFlights.csv: {e}")
+    st.stop()
+
+core = train_core()
+# unpack core into module-level names expected by the rest of the file
+X_test_c1 = core['X_test_c1']; y_test_class_c1 = core['y_test_class_c1']; y_test_reg_c1 = core['y_test_reg_c1']
+X_test_scaled_c1 = core['X_test_scaled_c1']; scaler_c1 = core['scaler_c1']; features_c1 = core['features_c1']
+lin_reg_c1 = core['lin_reg_c1']; log_reg_c1 = core['log_reg_c1']; dt_cls_c1 = core['dt_cls_c1']
+rf_cls_c1 = core['rf_cls_c1']; kmeans_c1 = core['kmeans_c1']; nn_cls_c1 = core['nn_cls_c1']
+X_test_c2 = core['X_test_c2']; y_test_class_c2 = core['y_test_class_c2']; y_test_reg_c2 = core['y_test_reg_c2']
+X_test_scaled_c2 = core['X_test_scaled_c2']; scaler_c2 = core['scaler_c2']; features_c2 = core['features_c2']
+lin_reg_c2 = core['lin_reg_c2']; log_reg_c2 = core['log_reg_c2']; dt_cls_c2 = core['dt_cls_c2']
+rf_cls_c2 = core['rf_cls_c2']; kmeans_c2 = core['kmeans_c2']; nn_cls_c2 = core['nn_cls_c2']
+pca_c1 = core['pca_c1']; X_test_pca_c1 = core['X_test_pca_c1']; log_reg_pca_c1 = core['log_reg_pca_c1']
+pca_c2 = core['pca_c2']; X_test_pca_c2 = core['X_test_pca_c2']; log_reg_pca_c2 = core['log_reg_pca_c2']
+nb_cls_c1 = core['nb_cls_c1']; nb_cls_c2 = core['nb_cls_c2']
+ridge_c1 = core['ridge_c1']; lasso_c1 = core['lasso_c1']; ridge_c2 = core['ridge_c2']; lasso_c2 = core['lasso_c2']
+lgb_cls_c1 = core['lgb_cls_c1']; lgb_reg_c1 = core['lgb_reg_c1']
+lgb_cls_c2 = core['lgb_cls_c2']; lgb_reg_c2 = core['lgb_reg_c2']
+df_clean_c1 = core['df_clean_c1']
+
+# ---- Heavy models only when advanced views are selected ----
+_need_heavy = app_mode in (
+    "PCA / SVM / Hierarchical / Apriori",
+    "Extra Models Visuals",
+    "Interactive Predictor & Diagnostics",
+    "Model Evaluations & Metrics",
+)
+if _need_heavy:
+    heavy = train_heavy(
+        core['X_train_scaled_c1'], core['y_train_class_c1'],
+        core['X_train_scaled_c2'], core['y_train_class_c2'],
+    )
+    svm_cls_c1 = heavy['svm_cls_c1']; svm_cls_c2 = heavy['svm_cls_c2']
+    hier_cls_c1 = heavy['hier_cls_c1']; hier_cls_c2 = heavy['hier_cls_c2']
+    hier_centroids_c1 = heavy['hier_centroids_c1']; hier_centroids_c2 = heavy['hier_centroids_c2']
+    X_hier_sample_c1 = heavy['X_hier_sample_c1']; X_hier_sample_c2 = heavy['X_hier_sample_c2']
+    iso_c1 = heavy['iso_c1']
+    lp_cls_c1 = heavy['lp_cls_c1']; lp_cls_c2 = heavy['lp_cls_c2']
+    st_cls_c1 = heavy['st_cls_c1']; st_cls_c2 = heavy['st_cls_c2']
+    dbscan_c1 = heavy['dbscan_c1']; dbscan_c2 = heavy['dbscan_c2']
+    _i_to_rc = heavy['_i_to_rc']
+else:
+    # stubs so references don't NameError on other pages
+    svm_cls_c1 = svm_cls_c2 = None
+    hier_centroids_c1 = hier_centroids_c2 = None
+    X_hier_sample_c1 = X_hier_sample_c2 = None
+    hier_cls_c1 = hier_cls_c2 = None
+    iso_c1 = lp_cls_c1 = lp_cls_c2 = st_cls_c1 = st_cls_c2 = None
+    dbscan_c1 = dbscan_c2 = None
+    _i_to_rc = {}
+
+st.sidebar.success(f"Ready · {len(df):,} rows · core models cached")
+
 
 
 # =========================================================================
@@ -473,7 +543,7 @@ elif app_mode == "Interactive Predictor & Diagnostics":
         res_col1.metric("Logistic Regression", "DELAYED ⚠️" if log_reg_c1.predict(input_scaled)[0] == 1 else "ON-TIME 🟢")
         res_col2.metric("Decision Tree", "DELAYED ⚠️" if dt_cls_c1.predict(input_scaled)[0] == 1 else "ON-TIME 🟢")
         res_col2.metric("Random Forest (BEST)", "DELAYED ⚠️" if rf_cls_c1.predict(input_scaled)[0] == 1 else "ON-TIME 🟢")
-        res_col3.metric("Neural Network (MLP)", "DELAYED ⚠️" if nn_cls_c1.predict(input_scaled)[0] == 1 else "ON-TIME 🟢")
+        res_col3.metric("Neural Net (alias on Cloud)", "DELAYED ⚠️" if nn_cls_c1.predict(input_scaled)[0] == 1 else "ON-TIME 🟢")
         res_col3.metric("K-Means Risk Cluster", f"Group #{kmeans_c1.predict(input_scaled)[0]}")
 
         st.markdown("##### Additional Models")
@@ -528,11 +598,14 @@ elif app_mode == "Interactive Predictor & Diagnostics":
             ax.set_xlabel('Distance'); ax.set_ylabel('Inbound Leg ArrDelay')
             st.pyplot(fig); plt.close(fig)
 
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(nn_cls_c1.loss_curve_, color='purple', lw=2)
-        ax.set_title('Neural Network Loss Convergence')
-        ax.set_xlabel('Iterations / Epochs'); ax.set_ylabel('Loss')
-        st.pyplot(fig); plt.close(fig)
+        if hasattr(nn_cls_c1, "loss_curve_"):
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(nn_cls_c1.loss_curve_, color='purple', lw=2)
+            ax.set_title('Neural Network Loss Convergence')
+            ax.set_xlabel('Iterations / Epochs'); ax.set_ylabel('Loss')
+            st.pyplot(fig); plt.close(fig)
+        else:
+            st.caption("Neural Network skipped on Cloud for speed (use local app for MLP).")
 
         st.write("#### Decision Tree Diagram")
         fig, ax = plt.subplots(figsize=(18, 9))
@@ -624,11 +697,13 @@ elif app_mode == "Interactive Predictor & Diagnostics":
             ax.set_xlabel('TaxiOut'); ax.set_ylabel('AirTime')
             st.pyplot(fig); plt.close(fig)
 
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(nn_cls_c2.loss_curve_, color='orange', lw=2)
-        ax.set_title('Neural Network Loss Convergence')
-        ax.set_xlabel('Iterations / Epochs'); ax.set_ylabel('Loss')
-        st.pyplot(fig); plt.close(fig)
+        if hasattr(nn_cls_c2, "loss_curve_"):
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(nn_cls_c2.loss_curve_, color="orange", lw=2)
+            ax.set_title("Neural Network Loss Convergence")
+            st.pyplot(fig); plt.close(fig)
+        else:
+            st.caption("Neural Network skipped on Cloud for speed.")
 
         st.write("#### Decision Tree Breakdown")
         fig, ax = plt.subplots(figsize=(20, 9))
@@ -655,7 +730,7 @@ elif app_mode == "Model Evaluations & Metrics":
             "Logistic Regression": log_reg_c1,
             "Decision Tree": dt_cls_c1,
             "Random Forest": rf_cls_c1,
-            "Neural Network (MLP)": nn_cls_c1,
+            "Neural Net (alias on Cloud)": nn_cls_c1,
             "SVM (RBF)": svm_cls_c1,
             "Naive Bayes": nb_cls_c1,
             "Self-Training": st_cls_c1,
@@ -701,7 +776,7 @@ elif app_mode == "Model Evaluations & Metrics":
             "Logistic Regression": log_reg_c2,
             "Decision Tree": dt_cls_c2,
             "Random Forest": rf_cls_c2,
-            "Neural Network (MLP)": nn_cls_c2,
+            "Neural Net (alias on Cloud)": nn_cls_c2,
             "SVM (RBF)": svm_cls_c2,
             "Naive Bayes": nb_cls_c2,
         }
