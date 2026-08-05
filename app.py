@@ -73,8 +73,8 @@ def load_data():
         'CarrierDelay', 'WeatherDelay', 'NASDelay', 'TaxiOut', 'AirTime'
     ]
     df = pd.read_csv('DelayedFlights.csv', usecols=cols)
-    if len(df) > 50000:
-        df = df.sample(n=50000, random_state=42).reset_index(drop=True)
+    if len(df) > 30000:
+        df = df.sample(n=30000, random_state=42).reset_index(drop=True)
     float_cols = df.select_dtypes(include=['float64']).columns
     df[float_cols] = df[float_cols].astype('float32')
     return df
@@ -91,8 +91,8 @@ except Exception as e:
 @st.cache_resource
 def train_models(test_r):
     rng = np.random.RandomState(42)
-    SVM_SAMPLE_SIZE = 3000
-    HIER_SAMPLE_SIZE = 1500
+    SVM_SAMPLE_SIZE = 2000
+    HIER_SAMPLE_SIZE = 1000
 
     # --- CODE 1 ---
     df_c1 = df.copy()
@@ -119,9 +119,9 @@ def train_models(test_r):
     lin_reg_c1 = LinearRegression().fit(X_train_scaled_c1, y_train_reg_c1)
     log_reg_c1 = LogisticRegression(class_weight='balanced', max_iter=500).fit(X_train_scaled_c1, y_train_class_c1)
     dt_cls_c1  = DecisionTreeClassifier(criterion='gini', max_depth=3, class_weight='balanced', random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
-    rf_cls_c1  = RandomForestClassifier(n_estimators=30, max_depth=5, class_weight='balanced', n_jobs=-1, random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
+    rf_cls_c1  = RandomForestClassifier(n_estimators=20, max_depth=4, class_weight='balanced', n_jobs=-1, random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
     kmeans_c1  = KMeans(n_clusters=2, random_state=42, n_init=5).fit(X_train_scaled_c1)
-    nn_cls_c1  = MLPClassifier(hidden_layer_sizes=(8, 4), max_iter=100, random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
+    nn_cls_c1  = MLPClassifier(hidden_layer_sizes=(6,), max_iter=60, random_state=42).fit(X_train_scaled_c1, y_train_class_c1)
 
     pca_c1 = PCA(n_components=2, random_state=42).fit(X_train_scaled_c1)
     X_train_pca_c1 = pca_c1.transform(X_train_scaled_c1)
@@ -169,9 +169,9 @@ def train_models(test_r):
     lin_reg_c2 = LinearRegression().fit(X_train_scaled_c2, y_train_reg_c2)
     log_reg_c2 = LogisticRegression(class_weight='balanced', max_iter=500).fit(X_train_scaled_c2, y_train_class_c2)
     dt_cls_c2  = DecisionTreeClassifier(criterion='gini', max_depth=3, class_weight='balanced', random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
-    rf_cls_c2  = RandomForestClassifier(n_estimators=30, max_depth=5, class_weight='balanced', n_jobs=-1, random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
+    rf_cls_c2  = RandomForestClassifier(n_estimators=20, max_depth=4, class_weight='balanced', n_jobs=-1, random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
     kmeans_c2  = KMeans(n_clusters=3, random_state=42, n_init=5).fit(X_train_scaled_c2)
-    nn_cls_c2  = MLPClassifier(hidden_layer_sizes=(8, 4), max_iter=100, random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
+    nn_cls_c2  = MLPClassifier(hidden_layer_sizes=(6,), max_iter=60, random_state=42).fit(X_train_scaled_c2, y_train_class_c2)
 
     pca_c2 = PCA(n_components=2, random_state=42).fit(X_train_scaled_c2)
     X_train_pca_c2 = pca_c2.transform(X_train_scaled_c2)
@@ -192,15 +192,15 @@ def train_models(test_r):
     # ---- Extra models (NB, IsolationForest, LabelProp, SelfTrain, Ridge/Lasso, LGBM, DBSCAN) ----
     nb_cls_c1 = GaussianNB().fit(X_train_scaled_c1, y_train_class_c1)
     nb_cls_c2 = GaussianNB().fit(X_train_scaled_c2, y_train_class_c2)
-    iso_c1 = IsolationForest(n_estimators=80, contamination=0.3, random_state=42, n_jobs=-1).fit(X_train_scaled_c1)
+    iso_c1 = IsolationForest(n_estimators=50, contamination=0.3, random_state=42, n_jobs=-1).fit(X_train_scaled_c1)
 
-    LP_SAMPLE = 3000
+    LP_SAMPLE = 1500
     lp_idx_c1 = rng.choice(len(X_train_scaled_c1), size=min(LP_SAMPLE, len(X_train_scaled_c1)), replace=False)
     X_lp_c1 = X_train_scaled_c1[lp_idx_c1]
     y_lp_c1 = y_train_class_c1.iloc[lp_idx_c1].values.copy()
     mask_n = int(0.4 * len(y_lp_c1))
     y_lp_c1[rng.choice(len(y_lp_c1), size=mask_n, replace=False)] = -1
-    lp_cls_c1 = LabelPropagation(kernel='rbf', max_iter=100).fit(X_lp_c1, y_lp_c1)
+    lp_cls_c1 = LabelPropagation(kernel='knn', n_neighbors=7, max_iter=200).fit(X_lp_c1, y_lp_c1)
 
     _rc_classes = sorted(y_train_class_c2.unique())
     _rc_to_i = {c: i for i, c in enumerate(_rc_classes)}
@@ -210,10 +210,10 @@ def train_models(test_r):
     y_lp_c2 = y_train_class_c2.iloc[lp_idx_c2].map(_rc_to_i).values.copy().astype(float)
     mask_n2 = int(0.4 * len(y_lp_c2))
     y_lp_c2[rng.choice(len(y_lp_c2), size=mask_n2, replace=False)] = -1
-    lp_cls_c2 = LabelPropagation(kernel='rbf', max_iter=100).fit(X_lp_c2, y_lp_c2)
+    lp_cls_c2 = LabelPropagation(kernel='knn', n_neighbors=7, max_iter=200).fit(X_lp_c2, y_lp_c2)
 
-    st_cls_c1 = SelfTrainingClassifier(LogisticRegression(class_weight='balanced', max_iter=400), threshold=0.75, max_iter=8).fit(X_lp_c1, y_lp_c1)
-    st_cls_c2 = SelfTrainingClassifier(LogisticRegression(class_weight='balanced', max_iter=400), threshold=0.75, max_iter=8).fit(X_lp_c2, y_lp_c2)
+    st_cls_c1 = SelfTrainingClassifier(LogisticRegression(class_weight='balanced', max_iter=400), threshold=0.75, max_iter=5).fit(X_lp_c1, y_lp_c1)
+    st_cls_c2 = SelfTrainingClassifier(LogisticRegression(class_weight='balanced', max_iter=400), threshold=0.75, max_iter=5).fit(X_lp_c2, y_lp_c2)
 
     ridge_c1 = Ridge(alpha=1.0).fit(X_train_scaled_c1, y_train_reg_c1)
     lasso_c1 = Lasso(alpha=0.1, max_iter=1500).fit(X_train_scaled_c1, y_train_reg_c1)
@@ -221,14 +221,14 @@ def train_models(test_r):
     lasso_c2 = Lasso(alpha=0.1, max_iter=1500).fit(X_train_scaled_c2, y_train_reg_c2)
 
     if LIGHTGBM_AVAILABLE:
-        lgb_cls_c1 = lgb.LGBMClassifier(n_estimators=60, max_depth=5, class_weight='balanced', random_state=42, verbosity=-1).fit(X_train_scaled_c1, y_train_class_c1)
-        lgb_reg_c1 = lgb.LGBMRegressor(n_estimators=60, max_depth=5, random_state=42, verbosity=-1).fit(X_train_scaled_c1, y_train_reg_c1)
-        lgb_cls_c2 = lgb.LGBMClassifier(n_estimators=60, max_depth=5, class_weight='balanced', random_state=42, verbosity=-1).fit(X_train_scaled_c2, y_train_class_c2)
-        lgb_reg_c2 = lgb.LGBMRegressor(n_estimators=60, max_depth=5, random_state=42, verbosity=-1).fit(X_train_scaled_c2, y_train_reg_c2)
+        lgb_cls_c1 = lgb.LGBMClassifier(n_estimators=40, max_depth=4, class_weight='balanced', random_state=42, verbosity=-1).fit(X_train_scaled_c1, y_train_class_c1)
+        lgb_reg_c1 = lgb.LGBMRegressor(n_estimators=40, max_depth=4, random_state=42, verbosity=-1).fit(X_train_scaled_c1, y_train_reg_c1)
+        lgb_cls_c2 = lgb.LGBMClassifier(n_estimators=40, max_depth=4, class_weight='balanced', random_state=42, verbosity=-1).fit(X_train_scaled_c2, y_train_class_c2)
+        lgb_reg_c2 = lgb.LGBMRegressor(n_estimators=40, max_depth=4, random_state=42, verbosity=-1).fit(X_train_scaled_c2, y_train_reg_c2)
     else:
         lgb_cls_c1 = lgb_reg_c1 = lgb_cls_c2 = lgb_reg_c2 = None
 
-    DBSCAN_SAMPLE = 2000
+    DBSCAN_SAMPLE = 1200
     db_idx_c1 = rng.choice(len(X_train_scaled_c1), size=min(DBSCAN_SAMPLE, len(X_train_scaled_c1)), replace=False)
     dbscan_c1 = DBSCAN(eps=0.8, min_samples=12).fit(X_train_scaled_c1[db_idx_c1])
     db_idx_c2 = rng.choice(len(X_train_scaled_c2), size=min(DBSCAN_SAMPLE, len(X_train_scaled_c2)), replace=False)
