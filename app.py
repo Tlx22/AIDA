@@ -61,6 +61,7 @@ app_mode = st.sidebar.selectbox(
         "Interactive Predictor & Diagnostics",
         "Model Evaluations & Metrics",
         "PCA / SVM / Hierarchical / Apriori",
+        "Extra Models Visuals",
         "Correlation Matrix"
     ]
 )
@@ -261,10 +262,171 @@ with st.spinner("Training models (incl. PCA, SVM, Hierarchical, NB, LightGBM...)
  lgb_cls_c1, lgb_reg_c1, lgb_cls_c2, lgb_reg_c2,
  dbscan_c1, dbscan_c2, _i_to_rc) = extra_models
 
+
+# =========================================================================
+# EXTRA MODELS VISUALS
+# =========================================================================
+if app_mode == "Extra Models Visuals":
+    st.header("🎨 Extra Models — Visual Analysis")
+    st.caption("Naive Bayes · Isolation Forest · Label Propagation · Self-Training · Ridge/Lasso · LightGBM · DBSCAN")
+
+    PLOT_N = min(4000, len(X_test_scaled_c1))
+    rng_v = np.random.RandomState(42)
+    plot_idx = rng_v.choice(len(X_test_scaled_c1), size=PLOT_N, replace=False)
+    X_plot = X_test_scaled_c1[plot_idx]
+    y_plot = y_test_class_c1.iloc[plot_idx]
+    X_plot_raw = X_test_c1.iloc[plot_idx]
+    y_reg_plot = y_test_reg_c1.iloc[plot_idx]
+
+    tab_reg, tab_iso, tab_roc, tab_lgb, tab_db, tab_agree = st.tabs([
+        "Ridge / Lasso Reg", "Isolation Forest", "ROC (NB / LP / ST)", "LightGBM", "DBSCAN", "Agreement"
+    ])
+
+    with tab_reg:
+        st.subheader("Actual vs Predicted Arrival Delay (Code 1)")
+        cols = st.columns(3)
+        models_reg = [
+            (ridge_c1, "Ridge", "steelblue"),
+            (lasso_c1, "Lasso", "darkorange"),
+            (lgb_reg_c1 if LIGHTGBM_AVAILABLE else None, "LightGBM", "seagreen"),
+        ]
+        for col, (model, name, color) in zip(cols, models_reg):
+            with col:
+                fig, ax = plt.subplots(figsize=(4, 3.5))
+                if model is None:
+                    ax.set_title(f"{name}: not installed")
+                else:
+                    pred = model.predict(X_plot)
+                    ax.scatter(y_reg_plot, pred, alpha=0.3, s=8, color=color)
+                    lo, hi = float(y_reg_plot.min()), float(y_reg_plot.max())
+                    ax.plot([lo, hi], [lo, hi], "k--", lw=1)
+                    ax.set_title(f"{name} (R²={r2_score(y_reg_plot, pred):.3f})")
+                    ax.set_xlabel("Actual"); ax.set_ylabel("Predicted")
+                st.pyplot(fig); plt.close(fig)
+
+        st.subheader("Ridge vs Lasso Coefficients")
+        fig, ax = plt.subplots(figsize=(7, 3.5))
+        coef_df = pd.DataFrame({"Ridge": ridge_c1.coef_, "Lasso": lasso_c1.coef_}, index=features_c1)
+        coef_df.plot(kind="bar", ax=ax, color=["steelblue", "darkorange"], rot=0)
+        ax.axhline(0, color="gray", lw=0.8)
+        ax.set_ylabel("Coefficient")
+        st.pyplot(fig); plt.close(fig)
+
+    with tab_iso:
+        st.subheader("Isolation Forest — Anomaly Detection (Code 1)")
+        iso_scores = -iso_c1.score_samples(X_plot)
+        iso_labels = iso_c1.predict(X_plot)
+        c1, c2 = st.columns(2)
+        with c1:
+            fig, ax = plt.subplots(figsize=(5, 4))
+            ax.hist(iso_scores[iso_labels == 1], bins=35, alpha=0.7, label="Normal", color="steelblue")
+            ax.hist(iso_scores[iso_labels == -1], bins=35, alpha=0.7, label="Anomaly", color="crimson")
+            ax.set_xlabel("Anomaly Score"); ax.set_ylabel("Count")
+            ax.set_title("Score Distribution"); ax.legend()
+            st.pyplot(fig); plt.close(fig)
+        with c2:
+            fig, ax = plt.subplots(figsize=(5, 4))
+            sc = ax.scatter(X_plot_raw["Distance"], X_plot_raw["Inbound_Leg_ArrDelay"],
+                            c=iso_labels, cmap="RdYlGn", alpha=0.5, s=10)
+            ax.set_xlabel("Distance"); ax.set_ylabel("Inbound Leg ArrDelay")
+            ax.set_title("Anomalies in Feature Space")
+            plt.colorbar(sc, ax=ax, label="-1=anomaly")
+            st.pyplot(fig); plt.close(fig)
+
+    with tab_roc:
+        st.subheader("ROC Curves — Naive Bayes / Label Propagation / Self-Training")
+        fig, ax = plt.subplots(figsize=(7, 5))
+        for clf, name in [(nb_cls_c1, "Naive Bayes"), (lp_cls_c1, "Label Propagation"), (st_cls_c1, "Self-Training")]:
+            try:
+                scores = clf.predict_proba(X_plot)[:, 1]
+            except Exception:
+                scores = clf.predict(X_plot).astype(float)
+            fpr, tpr, _ = roc_curve(y_plot, scores)
+            ax.plot(fpr, tpr, lw=2, label=f"{name} (AUC={auc(fpr, tpr):.3f})")
+        if LIGHTGBM_AVAILABLE and lgb_cls_c1 is not None:
+            scores = lgb_cls_c1.predict_proba(X_plot)[:, 1]
+            fpr, tpr, _ = roc_curve(y_plot, scores)
+            ax.plot(fpr, tpr, lw=2, label=f"LightGBM (AUC={auc(fpr, tpr):.3f})")
+        ax.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.6)
+        ax.set_xlabel("FPR"); ax.set_ylabel("TPR")
+        ax.set_title("Extra Classifiers ROC (Code 1)")
+        ax.legend(loc="lower right")
+        st.pyplot(fig); plt.close(fig)
+
+    with tab_lgb:
+        if not LIGHTGBM_AVAILABLE or lgb_cls_c1 is None:
+            st.warning("LightGBM is not installed. Run: `pip install lightgbm`")
+        else:
+            st.subheader("LightGBM Feature Importance")
+            c1, c2 = st.columns(2)
+            with c1:
+                fig, ax = plt.subplots(figsize=(5, 3.5))
+                pd.Series(lgb_cls_c1.feature_importances_, index=features_c1).plot(kind="barh", ax=ax, color="teal")
+                ax.set_title("Code 1 Classifier")
+                st.pyplot(fig); plt.close(fig)
+            with c2:
+                fig, ax = plt.subplots(figsize=(5, 3.5))
+                pd.Series(lgb_cls_c2.feature_importances_, index=features_c2).plot(kind="barh", ax=ax, color="darkgreen")
+                ax.set_title("Code 2 Classifier")
+                st.pyplot(fig); plt.close(fig)
+
+    with tab_db:
+        st.subheader("DBSCAN Density-Based Clusters")
+        c1, c2 = st.columns(2)
+        with c1:
+            db_viz1 = DBSCAN(eps=0.8, min_samples=12).fit(X_plot)
+            fig, ax = plt.subplots(figsize=(5, 4))
+            ax.scatter(X_plot_raw["Distance"], X_plot_raw["Inbound_Leg_ArrDelay"],
+                       c=db_viz1.labels_, cmap="tab10", s=10, alpha=0.6)
+            n_cl = len(set(db_viz1.labels_)) - (1 if -1 in db_viz1.labels_ else 0)
+            n_noise = list(db_viz1.labels_).count(-1)
+            ax.set_title(f"Code 1: {n_cl} clusters, {n_noise} noise")
+            ax.set_xlabel("Distance"); ax.set_ylabel("Inbound Delay")
+            st.pyplot(fig); plt.close(fig)
+        with c2:
+            PLOT_N2 = min(4000, len(X_test_scaled_c2))
+            idx2 = rng_v.choice(len(X_test_scaled_c2), size=PLOT_N2, replace=False)
+            X_plot2 = X_test_scaled_c2[idx2]
+            X_raw2 = X_test_c2.iloc[idx2]
+            db_viz2 = DBSCAN(eps=0.8, min_samples=12).fit(X_plot2)
+            fig, ax = plt.subplots(figsize=(5, 4))
+            ax.scatter(X_raw2["TaxiOut"], X_raw2["AirTime"],
+                       c=db_viz2.labels_, cmap="tab10", s=10, alpha=0.6)
+            n_cl = len(set(db_viz2.labels_)) - (1 if -1 in db_viz2.labels_ else 0)
+            n_noise = list(db_viz2.labels_).count(-1)
+            ax.set_title(f"Code 2: {n_cl} clusters, {n_noise} noise")
+            ax.set_xlabel("TaxiOut"); ax.set_ylabel("AirTime")
+            st.pyplot(fig); plt.close(fig)
+
+        st.info(f"Fitted DBSCAN (train subsample): Code1 clusters="
+                f"{len(set(dbscan_c1.labels_))-(1 if -1 in dbscan_c1.labels_ else 0)}, "
+                f"noise={list(dbscan_c1.labels_).count(-1)} | Code2 clusters="
+                f"{len(set(dbscan_c2.labels_))-(1 if -1 in dbscan_c2.labels_ else 0)}, "
+                f"noise={list(dbscan_c2.labels_).count(-1)}")
+
+    with tab_agree:
+        st.subheader("Prediction Agreement vs Random Forest (Code 1)")
+        pred_nb = nb_cls_c1.predict(X_plot)
+        pred_lp = lp_cls_c1.predict(X_plot)
+        pred_st = st_cls_c1.predict(X_plot)
+        pred_rf = rf_cls_c1.predict(X_plot)
+        agree = pd.Series({
+            "NB vs RF": (pred_nb == pred_rf).mean(),
+            "LabelProp vs RF": (pred_lp == pred_rf).mean(),
+            "SelfTrain vs RF": (pred_st == pred_rf).mean(),
+            "NB vs LabelProp": (pred_nb == pred_lp).mean(),
+        })
+        fig, ax = plt.subplots(figsize=(7, 3.5))
+        agree.plot(kind="barh", ax=ax, color="slateblue")
+        ax.set_xlim(0, 1)
+        ax.set_xlabel("Agreement rate")
+        st.pyplot(fig); plt.close(fig)
+        st.dataframe(agree.rename("Agreement").to_frame())
+
 # =========================================================================
 # CORRELATION MATRIX
 # =========================================================================
-if app_mode == "Correlation Matrix":
+elif app_mode == "Correlation Matrix":
     st.header("🔗 Correlation Matrix — All Numerical Features")
     st.write("Pearson correlation on the cloud-optimized column subset / capped sample.")
     numeric_df = df.select_dtypes(include=[np.number])
