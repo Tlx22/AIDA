@@ -1,4 +1,5 @@
 import pandas as pd
+from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -1023,6 +1024,128 @@ def evaluate_extra_models():
 # =========================================================================
 # MAIN MENU LOOP (Back / navigate freely — never stuck)
 # =========================================================================
+
+def _normalize_upload_df(raw):
+    dfu = raw.copy()
+    dfu.columns = [str(c).strip() for c in dfu.columns]
+    lower = {c.lower(): c for c in dfu.columns}
+    aliases = {
+        "distance": "Distance", "crsdeptime": "CRSDepTime", "deptime": "CRSDepTime",
+        "dephour": "DepHour", "arrdelay": "ArrDelay", "taxiout": "TaxiOut",
+        "airtime": "AirTime", "tailnum": "TailNum", "carrierdelay": "CarrierDelay",
+        "weatherdelay": "WeatherDelay", "nasdelay": "NASDelay",
+        "inbound_leg_arrdelay": "Inbound_Leg_ArrDelay", "inbounddelay": "Inbound_Leg_ArrDelay",
+    }
+    rename = {}
+    for low, std in aliases.items():
+        if low in lower and std not in dfu.columns:
+            rename[lower[low]] = std
+    if rename:
+        dfu = dfu.rename(columns=rename)
+    if "DepHour" not in dfu.columns and "CRSDepTime" in dfu.columns:
+        dfu["DepHour"] = (pd.to_numeric(dfu["CRSDepTime"], errors="coerce").fillna(1200) // 100).astype(int)
+    if "DepHour" not in dfu.columns:
+        dfu["DepHour"] = 12
+    for col, default in [
+        ("Distance", 500.0), ("Inbound_Leg_ArrDelay", 0.0), ("TaxiOut", 15.0),
+        ("AirTime", 100.0), ("CarrierDelay", 0.0), ("WeatherDelay", 0.0),
+        ("NASDelay", 0.0), ("ArrDelay", 0.0),
+    ]:
+        if col not in dfu.columns:
+            dfu[col] = default
+        else:
+            dfu[col] = pd.to_numeric(dfu[col], errors="coerce").fillna(default)
+    dfu["DepHour"] = dfu["DepHour"].clip(0, 23).astype(int)
+    return dfu
+
+
+def run_upload_and_score():
+    """Score an external CSV/Excel and optionally append to DelayedFlightswupdates.csv."""
+    print("\n" + "="*60)
+    print("   UPLOAD & SCORE NEW FLIGHTS → DelayedFlightswupdates.csv")
+    print("="*60)
+    print("Expected columns (subset OK): Distance, CRSDepTime/DepHour, ArrDelay,")
+    print("  TaxiOut, AirTime, TailNum, CarrierDelay, WeatherDelay, NASDelay")
+    path = input("\nPath to CSV or Excel file (or press Enter to cancel): ").strip().strip('"')
+    if not path:
+        print("Cancelled.")
+        return
+    try:
+        if path.lower().endswith((".xlsx", ".xls")):
+            raw = pd.read_excel(path)
+        else:
+            raw = pd.read_csv(path)
+    except Exception as e:
+        print(f"Failed to read file: {e}")
+        return
+
+    print(f"Loaded {len(raw):,} rows from {path}")
+    dfu = _normalize_upload_df(raw)
+
+    # Code 1 score
+    X1s = scaler_c1.transform(dfu[features_c1])
+    X1p = pca_c1.transform(X1s)
+    dfu["Pred_ArrDelay_mins"] = lin_reg_c1.predict(X1s)
+    dfu["Pred_SevereDelay_RF"] = rf_cls_c1.predict(X1s)
+    dfu["Pred_SevereDelay_LogReg"] = log_reg_c1.predict(X1s)
+    dfu["Pred_SevereDelay_NB"] = nb_cls_c1.predict(X1s)
+    dfu["Pred_SevereDelay_SVM"] = svm_cls_c1.predict(X1s)
+    dfu["Pred_SevereDelay_PCA"] = log_reg_pca_c1.predict(X1p)
+    dfu["KMeans_Cluster_C1"] = kmeans_c1.predict(X1s)
+    dfu["Hier_Cluster_C1"] = [hier_predict(row, hier_centroids_c1) for row in X1s]
+    dfu["IsolationForest"] = iso_c1.predict(X1s)
+    dfu["Is_Anomaly"] = (dfu["IsolationForest"] == -1).astype(int)
+    if hasattr(rf_cls_c1, "predict_proba"):
+        dfu["Prob_SevereDelay_RF"] = rf_cls_c1.predict_proba(X1s)[:, 1]
+
+    # Code 2 score
+    X2s = scaler_c2.transform(dfu[features_c2])
+    X2p = pca_c2.transform(X2s)
+    dfu["Pred_CarrierDelay_mins"] = lin_reg_c2.predict(X2s)
+    dfu["Pred_RootCause_RF"] = rf_cls_c2.predict(X2s)
+    dfu["Pred_RootCause_LogReg"] = log_reg_c2.predict(X2s)
+    dfu["Pred_RootCause_NB"] = nb_cls_c2.predict(X2s)
+    dfu["Pred_RootCause_SVM"] = svm_cls_c2.predict(X2s)
+    dfu["Pred_RootCause_PCA"] = log_reg_pca_c2.predict(X2p)
+    dfu["KMeans_Cluster_C2"] = kmeans_c2.predict(X2s)
+    dfu["Hier_Cluster_C2"] = [hier_predict(row, hier_centroids_c2) for row in X2s]
+    if LIGHTGBM_AVAILABLE and lgb_cls_c1 is not None:
+        dfu["Pred_SevereDelay_LGBM"] = lgb_cls_c1.predict(X1s)
+        dfu["Pred_RootCause_LGBM"] = lgb_cls_c2.predict(X2s)
+
+    # Metrics if labels present
+    true_sev = (dfu["ArrDelay"] >= 45).astype(int)
+    pred_sev = dfu["Pred_SevereDelay_RF"].astype(int)
+    print(f"\nRF accuracy vs ArrDelay≥45 on upload: {(true_sev == pred_sev).mean():.4f}")
+    print(f"Predicted severe rate: {pred_sev.mean():.4f} | Actual severe rate: {true_sev.mean():.4f}")
+    print("\nSample scored rows:")
+    cols_show = [c for c in [
+        "Distance", "DepHour", "ArrDelay", "Pred_ArrDelay_mins", "Pred_SevereDelay_RF",
+        "Pred_RootCause_RF", "KMeans_Cluster_C1", "Is_Anomaly"
+    ] if c in dfu.columns]
+    print(dfu[cols_show].head(10).to_string(index=False))
+
+    out_path = "DelayedFlightswupdates.csv"
+    ans = input(f"\nAppend these {len(dfu):,} scored rows to {out_path}? [y/N]: ").strip().lower()
+    if ans == "y":
+        if Path(out_path).exists():
+            prev = pd.read_csv(out_path)
+            combined = pd.concat([prev, dfu], ignore_index=True)
+            print(f"Appending to existing file ({len(prev):,} prior rows).")
+        else:
+            combined = dfu
+        combined.to_csv(out_path, index=False)
+        print(f"Saved {len(combined):,} total rows → {out_path}")
+    else:
+        # still offer a one-off export
+        ans2 = input("Save this batch only (overwrite/create DelayedFlightswupdates.csv)? [y/N]: ").strip().lower()
+        if ans2 == "y":
+            dfu.to_csv(out_path, index=False)
+            print(f"Wrote {len(dfu):,} rows → {out_path}")
+        else:
+            print("Not saved.")
+
+
 def show_main_menu():
     print("\n" + "="*60)
     print("                    MAIN MENU")
@@ -1038,8 +1161,9 @@ def show_main_menu():
     print("9. Interactive Predictor & Diagnosis")
     print("10. Show Random Hold-Out Test Samples")
     print("11. Extra Models Visuals (NB / IsolationForest / LabelProp / SelfTrain / Ridge-Lasso / LightGBM / DBSCAN)")
+    print("12. Upload & Score New Flights → DelayedFlightswupdates.csv")
     print("0. Exit System")
-    return input("\nSelect an option (0-11): ").strip()
+    return input("\nSelect an option (0-12): ").strip()
 
 def show_predictor_menu():
     print("\n" + "="*60)
@@ -1182,14 +1306,16 @@ while True:
         show_random_samples()
     elif eval_choice == '11':
         evaluate_extra_models()
+    elif eval_choice == '12':
+        run_upload_and_score()
     elif eval_choice == '0':
         print("\nExiting Flight Analytics System. Have a great day!")
         break
     else:
-        print("\nInvalid choice. Please enter a number from 0–11.")
+        print("\nInvalid choice. Please enter a number from 0–12.")
 
     # After any evaluation (1–8, 10), offer a quick continue prompt
-    if eval_choice in {'1', '2', '3', '4', '5', '6', '7', '8', '10', '11'}:
+    if eval_choice in {'1', '2', '3', '4', '5', '6', '7', '8', '10', '11', '12'}:
         cont = input("\nPress Enter to return to Main Menu (or type 0 then Enter to Exit): ").strip()
         if cont == '0':
             print("\nExiting Flight Analytics System. Have a great day!")

@@ -60,6 +60,7 @@ app_mode = st.sidebar.selectbox(
     "Choose Dashboard View:",
     [
         "Interactive Predictor & Diagnostics",
+        "Upload & Score New Flights",
         "Model Evaluations & Metrics",
         "PCA / SVM / Hierarchical / Apriori",
         "Extra Models Visuals",
@@ -302,6 +303,7 @@ _need_heavy = app_mode in (
     "Extra Models Visuals",
     "Interactive Predictor & Diagnostics",
     "Model Evaluations & Metrics",
+    "Upload & Score New Flights",
 )
 if _need_heavy:
     heavy = train_heavy(
@@ -334,7 +336,312 @@ st.sidebar.success(f"Ready · {len(df):,} rows · core models cached")
 # =========================================================================
 # EXTRA MODELS VISUALS
 # =========================================================================
-if app_mode == "Extra Models Visuals":
+
+# =========================================================================
+# UPLOAD & SCORE NEW FLIGHTS
+# =========================================================================
+if app_mode == "Upload & Score New Flights":
+    st.header("📥 Upload & Score New Flights")
+    st.caption(
+        "Upload a CSV/Excel in DelayedFlights-style format. Models score each row "
+        "(severe delay + root cause). Optionally append to **DelayedFlightswupdates.csv** and download."
+    )
+
+    REQUIRED_HINT = (
+        "Useful columns: Distance, CRSDepTime (or DepHour), ArrDelay, TaxiOut, AirTime, "
+        "TailNum, CarrierDelay, WeatherDelay, NASDelay. Missing fields are filled with 0 / defaults."
+    )
+    st.info(REQUIRED_HINT)
+
+    uploaded = st.file_uploader(
+        "Upload CSV or Excel (.csv / .xlsx)",
+        type=["csv", "xlsx", "xls"],
+        accept_multiple_files=False,
+    )
+
+    # Manual single-row entry
+    with st.expander("Or type a single flight manually"):
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        with mc1:
+            m_dist = st.number_input("Distance (miles)", 10.0, 5000.0, 800.0, key="m_dist")
+            m_taxi = st.number_input("TaxiOut (mins)", 0.0, 300.0, 15.0, key="m_taxi")
+        with mc2:
+            m_hour = st.slider("DepHour (0-23)", 0, 23, 14, key="m_hour")
+            m_air = st.number_input("AirTime (mins)", 0.0, 1000.0, 120.0, key="m_air")
+        with mc3:
+            m_inbound = st.number_input("Inbound leg ArrDelay (mins)", 0.0, 1000.0, 0.0, key="m_inb")
+            m_arr = st.number_input("ArrDelay (optional, blank=unknown)", -100.0, 2000.0, 0.0, key="m_arr")
+        with mc4:
+            m_carrier = st.number_input("CarrierDelay", 0.0, 1000.0, 0.0, key="m_car")
+            m_weather = st.number_input("WeatherDelay", 0.0, 1000.0, 0.0, key="m_wth")
+            m_nas = st.number_input("NASDelay", 0.0, 1000.0, 0.0, key="m_nas")
+        use_manual = st.checkbox("Score this manual row", value=False)
+
+    def _normalize_upload(raw: pd.DataFrame) -> pd.DataFrame:
+        """Map common column names and ensure model inputs exist."""
+        dfu = raw.copy()
+        # strip spaces
+        dfu.columns = [str(c).strip() for c in dfu.columns]
+        # common aliases
+        rename = {}
+        lower = {c.lower(): c for c in dfu.columns}
+        aliases = {
+            "distance": "Distance",
+            "crsdeptime": "CRSDepTime",
+            "deptime": "CRSDepTime",
+            "dephour": "DepHour",
+            "arrdelay": "ArrDelay",
+            "taxiout": "TaxiOut",
+            "airtime": "AirTime",
+            "tailnum": "TailNum",
+            "carrierdelay": "CarrierDelay",
+            "weatherdelay": "WeatherDelay",
+            "nasdelay": "NASDelay",
+            "inbound_leg_arrdelay": "Inbound_Leg_ArrDelay",
+            "inbounddelay": "Inbound_Leg_ArrDelay",
+        }
+        for low, std in aliases.items():
+            if low in lower and std not in dfu.columns:
+                rename[lower[low]] = std
+        if rename:
+            dfu = dfu.rename(columns=rename)
+
+        if "DepHour" not in dfu.columns and "CRSDepTime" in dfu.columns:
+            dfu["DepHour"] = (pd.to_numeric(dfu["CRSDepTime"], errors="coerce").fillna(1200) // 100).astype(int)
+        if "DepHour" not in dfu.columns:
+            dfu["DepHour"] = 12
+        if "Distance" not in dfu.columns:
+            dfu["Distance"] = 500.0
+        if "Inbound_Leg_ArrDelay" not in dfu.columns:
+            dfu["Inbound_Leg_ArrDelay"] = 0.0
+        if "TaxiOut" not in dfu.columns:
+            dfu["TaxiOut"] = 15.0
+        if "AirTime" not in dfu.columns:
+            dfu["AirTime"] = 100.0
+        for c in ["CarrierDelay", "WeatherDelay", "NASDelay", "ArrDelay"]:
+            if c not in dfu.columns:
+                dfu[c] = 0.0
+            else:
+                dfu[c] = pd.to_numeric(dfu[c], errors="coerce").fillna(0.0)
+
+        for c in ["Distance", "DepHour", "Inbound_Leg_ArrDelay", "TaxiOut", "AirTime"]:
+            dfu[c] = pd.to_numeric(dfu[c], errors="coerce")
+        dfu["Distance"] = dfu["Distance"].fillna(500.0)
+        dfu["DepHour"] = dfu["DepHour"].fillna(12).clip(0, 23).astype(int)
+        dfu["Inbound_Leg_ArrDelay"] = dfu["Inbound_Leg_ArrDelay"].fillna(0.0)
+        dfu["TaxiOut"] = dfu["TaxiOut"].fillna(15.0)
+        dfu["AirTime"] = dfu["AirTime"].fillna(100.0)
+        return dfu
+
+    def _score_batch(dfu: pd.DataFrame) -> pd.DataFrame:
+        out = dfu.copy()
+        # Code 1
+        X1 = out[features_c1]
+        X1s = scaler_c1.transform(X1)
+        X1p = pca_c1.transform(X1s)
+        out["Pred_ArrDelay_mins"] = lin_reg_c1.predict(X1s)
+        out["Pred_SevereDelay_RF"] = rf_cls_c1.predict(X1s)
+        out["Pred_SevereDelay_LogReg"] = log_reg_c1.predict(X1s)
+        out["Pred_SevereDelay_NB"] = nb_cls_c1.predict(X1s)
+        if svm_cls_c1 is not None:
+            out["Pred_SevereDelay_SVM"] = svm_cls_c1.predict(X1s)
+        out["Pred_SevereDelay_PCA"] = log_reg_pca_c1.predict(X1p)
+        out["KMeans_Cluster_C1"] = kmeans_c1.predict(X1s)
+        if iso_c1 is not None:
+            out["IsolationForest"] = iso_c1.predict(X1s)
+            out["Is_Anomaly"] = (out["IsolationForest"] == -1).astype(int)
+        if hier_centroids_c1 is not None:
+            out["Hier_Cluster_C1"] = [
+                int(np.argmin(np.linalg.norm(hier_centroids_c1 - row, axis=1))) for row in X1s
+            ]
+        # probabilities
+        if hasattr(rf_cls_c1, "predict_proba"):
+            out["Prob_SevereDelay_RF"] = rf_cls_c1.predict_proba(X1s)[:, 1]
+
+        # Code 2
+        X2 = out[features_c2]
+        X2s = scaler_c2.transform(X2)
+        X2p = pca_c2.transform(X2s)
+        out["Pred_CarrierDelay_mins"] = lin_reg_c2.predict(X2s)
+        out["Pred_RootCause_RF"] = rf_cls_c2.predict(X2s)
+        out["Pred_RootCause_LogReg"] = log_reg_c2.predict(X2s)
+        out["Pred_RootCause_NB"] = nb_cls_c2.predict(X2s)
+        if svm_cls_c2 is not None:
+            out["Pred_RootCause_SVM"] = svm_cls_c2.predict(X2s)
+        out["Pred_RootCause_PCA"] = log_reg_pca_c2.predict(X2p)
+        out["KMeans_Cluster_C2"] = kmeans_c2.predict(X2s)
+        if hier_centroids_c2 is not None:
+            out["Hier_Cluster_C2"] = [
+                int(np.argmin(np.linalg.norm(hier_centroids_c2 - row, axis=1))) for row in X2s
+            ]
+        if LIGHTGBM_AVAILABLE and lgb_cls_c1 is not None:
+            out["Pred_SevereDelay_LGBM"] = lgb_cls_c1.predict(X1s)
+            out["Pred_RootCause_LGBM"] = lgb_cls_c2.predict(X2s)
+        return out
+
+    scored = None
+    source_label = ""
+
+    if use_manual:
+        manual_row = pd.DataFrame([{
+            "Distance": m_dist,
+            "DepHour": m_hour,
+            "Inbound_Leg_ArrDelay": m_inbound,
+            "TaxiOut": m_taxi,
+            "AirTime": m_air,
+            "ArrDelay": m_arr,
+            "CarrierDelay": m_carrier,
+            "WeatherDelay": m_weather,
+            "NASDelay": m_nas,
+        }])
+        scored = _score_batch(_normalize_upload(manual_row))
+        source_label = "manual entry"
+    elif uploaded is not None:
+        try:
+            if uploaded.name.lower().endswith((".xlsx", ".xls")):
+                raw = pd.read_excel(uploaded)
+            else:
+                raw = pd.read_csv(uploaded)
+            st.success(f"Loaded **{len(raw):,}** rows from `{uploaded.name}`")
+            with st.expander("Preview raw upload"):
+                st.dataframe(raw.head(20))
+            normed = _normalize_upload(raw)
+            # Cap scoring size on cloud for safety
+            max_score = 5000
+            if len(normed) > max_score:
+                st.warning(f"Scoring first {max_score:,} of {len(normed):,} rows (cloud limit).")
+                normed = normed.head(max_score)
+            scored = _score_batch(normed)
+            source_label = uploaded.name
+        except Exception as e:
+            st.error(f"Failed to read / score file: {e}")
+
+    if scored is not None:
+        st.subheader(f"📊 Scored results ({source_label})")
+        # Summary metrics if true labels present
+        has_label = "ArrDelay" in scored.columns and scored["ArrDelay"].notna().any()
+        if has_label:
+            true_sev = (scored["ArrDelay"] >= 45).astype(int)
+            pred_sev = scored["Pred_SevereDelay_RF"].astype(int)
+            # only rows where ArrDelay was provided meaningfully — still use all
+            acc = float((true_sev == pred_sev).mean())
+            c1, c2, c3 = st.columns(3)
+            c1.metric("RF accuracy vs ArrDelay≥45", f"{acc:.3f}")
+            c2.metric("Predicted severe rate", f"{pred_sev.mean():.3f}")
+            c3.metric("Actual severe rate", f"{true_sev.mean():.3f}")
+            try:
+                from sklearn.metrics import classification_report as _cr
+                st.dataframe(pd.DataFrame(_cr(
+                    true_sev, pred_sev, target_names=["On-Time", "Delayed"],
+                    output_dict=True, zero_division=0
+                )).transpose())
+            except Exception:
+                pass
+
+        show_cols = [c for c in [
+            "Distance", "DepHour", "Inbound_Leg_ArrDelay", "TaxiOut", "AirTime", "ArrDelay",
+            "Pred_ArrDelay_mins", "Pred_SevereDelay_RF", "Prob_SevereDelay_RF",
+            "Pred_RootCause_RF", "Pred_CarrierDelay_mins",
+            "KMeans_Cluster_C1", "KMeans_Cluster_C2", "Is_Anomaly",
+        ] if c in scored.columns]
+        st.dataframe(scored[show_cols].head(100))
+
+        # PCA overlay — where new points land
+        st.subheader("🗺️ Where the new data lands (PCA space)")
+        X1s_new = scaler_c1.transform(scored[features_c1])
+        pca_new = pca_c1.transform(X1s_new)
+        # background sample from test set
+        bg_n = min(2000, len(X_test_pca_c1))
+        bg = X_test_pca_c1[:bg_n]
+        bg_y = y_test_class_c1.iloc[:bg_n].values
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        axes[0].scatter(bg[:, 0], bg[:, 1], c=bg_y, cmap="coolwarm", s=8, alpha=0.25, label="Train/test cloud")
+        axes[0].scatter(pca_new[:, 0], pca_new[:, 1], c="black", s=40, marker="x", label="New flights")
+        axes[0].set_title("Code 1 PCA — new points (×) vs data cloud")
+        axes[0].set_xlabel("PC1"); axes[0].set_ylabel("PC2")
+        axes[0].legend(loc="best", fontsize=8)
+
+        X2s_new = scaler_c2.transform(scored[features_c2])
+        pca_new2 = pca_c2.transform(X2s_new)
+        bg2 = X_test_pca_c2[: min(2000, len(X_test_pca_c2))]
+        axes[1].scatter(bg2[:, 0], bg2[:, 1], s=8, alpha=0.25, color="steelblue", label="Data cloud")
+        axes[1].scatter(pca_new2[:, 0], pca_new2[:, 1], c="black", s=40, marker="x", label="New flights")
+        axes[1].set_title("Code 2 PCA — new points (×)")
+        axes[1].set_xlabel("PC1"); axes[1].set_ylabel("PC2")
+        axes[1].legend(loc="best", fontsize=8)
+        plt.tight_layout()
+        st.pyplot(fig); plt.close(fig)
+
+        # Root-cause breakdown
+        st.subheader("Root-cause predictions (RF)")
+        st.bar_chart(scored["Pred_RootCause_RF"].value_counts())
+
+        # Save / download
+        st.subheader("💾 Save updates")
+        st.caption(
+            "Downloads use the filename **DelayedFlightswupdates.csv**. "
+            "On Streamlit Cloud the file is offered as a download (server disk is ephemeral). "
+            "Locally you can also write it next to the app."
+        )
+
+        # Session working set
+        if "updates_df" not in st.session_state:
+            st.session_state["updates_df"] = pd.DataFrame()
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            if st.button("Append scored rows to session working set"):
+                st.session_state["updates_df"] = pd.concat(
+                    [st.session_state["updates_df"], scored], ignore_index=True
+                )
+                st.success(f"Working set now has {len(st.session_state['updates_df']):,} rows.")
+        with col_b:
+            csv_bytes = scored.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download this batch as DelayedFlightswupdates.csv",
+                data=csv_bytes,
+                file_name="DelayedFlightswupdates.csv",
+                mime="text/csv",
+            )
+        with col_c:
+            if len(st.session_state["updates_df"]):
+                all_bytes = st.session_state["updates_df"].to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download full working set",
+                    data=all_bytes,
+                    file_name="DelayedFlightswupdates.csv",
+                    mime="text/csv",
+                    key="dl_full_updates",
+                )
+
+        # Local write attempt (works on local Streamlit, ignored/fails harmlessly on Cloud)
+        write_local = st.checkbox("Also try writing DelayedFlightswupdates.csv next to the app (local only)")
+        if write_local and st.button("Write file now"):
+            try:
+                path = "DelayedFlightswupdates.csv"
+                # append if exists
+                if Path(path).exists():
+                    prev = pd.read_csv(path)
+                    combined = pd.concat([prev, scored], ignore_index=True)
+                else:
+                    combined = scored
+                combined.to_csv(path, index=False)
+                st.success(f"Wrote {len(combined):,} rows → `{path}`")
+            except Exception as e:
+                st.warning(f"Could not write locally (expected on Streamlit Cloud): {e}")
+
+        if len(st.session_state["updates_df"]):
+            with st.expander(f"Session working set ({len(st.session_state['updates_df']):,} rows)"):
+                st.dataframe(st.session_state["updates_df"].tail(50))
+                if st.button("Clear working set"):
+                    st.session_state["updates_df"] = pd.DataFrame()
+                    st.rerun()
+    else:
+        st.write("Upload a file or enable **Score this manual row** to begin.")
+
+
+elif app_mode == "Extra Models Visuals":
     st.header("🎨 Extra Models — Visual Analysis")
     st.caption("Naive Bayes · Isolation Forest · Label Propagation · Self-Training · Ridge/Lasso · LightGBM · DBSCAN")
 
