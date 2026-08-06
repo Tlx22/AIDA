@@ -261,8 +261,8 @@ def train_heavy(X_train_scaled_c1, y_train_class_c1, X_train_scaled_c2, y_train_
     lp_cls_c2 = LabelPropagation(kernel='knn', n_neighbors=9, max_iter=300).fit(X_lp2, y_lp2)
     st_cls_c2 = lp_cls_c2
 
-    db1 = DBSCAN(eps=0.9, min_samples=10).fit(Xh1)
-    db2 = DBSCAN(eps=0.9, min_samples=10).fit(Xh2)
+    db1 = DBSCAN(eps=0.4, min_samples=10).fit(Xh1)  # tuned: 2 clusters, ~17% noise
+    db2 = DBSCAN(eps=0.2, min_samples=10).fit(Xh2)  # tuned: 3 clusters, ~24% noise
 
     return dict(
         svm_cls_c1=svm_cls_c1, svm_cls_c2=svm_cls_c2,
@@ -853,7 +853,7 @@ elif app_mode == "Extra Models Visuals":
         st.subheader("DBSCAN Density-Based Clusters")
         c1, c2 = st.columns(2)
         with c1:
-            db_viz1 = DBSCAN(eps=0.8, min_samples=12).fit(X_plot)
+            db_viz1 = DBSCAN(eps=0.4, min_samples=12).fit(X_plot)
             fig, ax = plt.subplots(figsize=(5, 4))
             ax.scatter(X_plot_raw["Distance"], X_plot_raw["Inbound_Leg_ArrDelay"],
                        c=db_viz1.labels_, cmap="tab10", s=10, alpha=0.6)
@@ -867,7 +867,7 @@ elif app_mode == "Extra Models Visuals":
             idx2 = rng_v.choice(len(X_test_scaled_c2), size=PLOT_N2, replace=False)
             X_plot2 = X_test_scaled_c2[idx2]
             X_raw2 = X_test_c2.iloc[idx2]
-            db_viz2 = DBSCAN(eps=0.8, min_samples=12).fit(X_plot2)
+            db_viz2 = DBSCAN(eps=0.2, min_samples=12).fit(X_plot2)
             fig, ax = plt.subplots(figsize=(5, 4))
             ax.scatter(X_raw2["TaxiOut"], X_raw2["AirTime"],
                        c=db_viz2.labels_, cmap="tab10", s=10, alpha=0.6)

@@ -269,10 +269,10 @@ else:
 DBSCAN_SAMPLE = 3000
 db_idx_c1 = rng_extra.choice(len(X_train_scaled_c1), size=min(DBSCAN_SAMPLE, len(X_train_scaled_c1)), replace=False)
 X_db_c1 = X_train_scaled_c1[db_idx_c1]
-dbscan_c1 = DBSCAN(eps=0.8, min_samples=15).fit(X_db_c1)
+dbscan_c1 = DBSCAN(eps=0.4, min_samples=15).fit(X_db_c1)  # tuned via k-distance/eps sweep: 2 clusters, ~17% noise
 db_idx_c2 = rng_extra.choice(len(X_train_scaled_c2), size=min(DBSCAN_SAMPLE, len(X_train_scaled_c2)), replace=False)
 X_db_c2 = X_train_scaled_c2[db_idx_c2]
-dbscan_c2 = DBSCAN(eps=0.8, min_samples=15).fit(X_db_c2)
+dbscan_c2 = DBSCAN(eps=0.2, min_samples=15).fit(X_db_c2)  # tuned via eps sweep: 3 clusters, ~24% noise
 
 print("Extra models trained (Naive Bayes, Isolation Forest, Label Propagation,")
 print(" Self-Training, Ridge/Lasso, LightGBM, DBSCAN).")
@@ -980,7 +980,7 @@ def evaluate_extra_models():
     # Better DBSCAN 2D scatter: fit on plot subsample for display only
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle('DBSCAN Clusters in Feature Space (viz subsample)', fontsize=14)
-    db_viz1 = DBSCAN(eps=0.8, min_samples=12).fit(X_plot)
+    db_viz1 = DBSCAN(eps=0.4, min_samples=12).fit(X_plot)
     axes[0].scatter(X_plot_raw['Distance'], X_plot_raw['Inbound_Leg_ArrDelay'],
                     c=db_viz1.labels_, cmap='tab10', s=12, alpha=0.6)
     axes[0].set_xlabel('Distance'); axes[0].set_ylabel('Inbound Leg ArrDelay')
@@ -989,7 +989,7 @@ def evaluate_extra_models():
     plot_idx2 = _subsample_idx(len(X_test_scaled_c2), PLOT_MAX_ROWS)
     X_plot2 = X_test_scaled_c2[plot_idx2]
     X_raw2 = X_test_c2.iloc[plot_idx2]
-    db_viz2 = DBSCAN(eps=0.8, min_samples=12).fit(X_plot2)
+    db_viz2 = DBSCAN(eps=0.2, min_samples=12).fit(X_plot2)
     axes[1].scatter(X_raw2['TaxiOut'], X_raw2['AirTime'],
                     c=db_viz2.labels_, cmap='tab10', s=12, alpha=0.6)
     axes[1].set_xlabel('TaxiOut'); axes[1].set_ylabel('AirTime')
