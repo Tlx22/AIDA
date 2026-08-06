@@ -1146,6 +1146,96 @@ def run_upload_and_score():
             print("Not saved.")
 
 
+def run_retrain_preview():
+    """What-if check: refit RF on original-train + new data, evaluate on the SAME
+    held-out test set as the deployed models. Deployed models are never modified —
+    this is a side-by-side print-out only, nothing is saved or persisted."""
+    print("\n" + "="*60)
+    print("   PREVIEW: WHAT-IF RETRAIN (vs currently deployed models)")
+    print("="*60)
+    default_path = "DelayedFlightswupdates.csv"
+    prompt = f"Path to CSV/Excel with new data (Enter = use {default_path} if it exists): "
+    path = input("\n" + prompt).strip().strip('"')
+    if not path:
+        if Path(default_path).exists():
+            path = default_path
+        else:
+            print("No file given and no DelayedFlightswupdates.csv found. Cancelled.")
+            return
+    try:
+        if path.lower().endswith((".xlsx", ".xls")):
+            raw = pd.read_excel(path)
+        else:
+            raw = pd.read_csv(path)
+    except Exception as e:
+        print(f"Failed to read file: {e}")
+        return
+    print(f"Loaded {len(raw):,} rows from {path}")
+    dfu = _normalize_upload_df(raw)
+
+    # ---- Code 1: severe delay ----
+    new_c1 = dfu[features_c1 + ["ArrDelay"]].dropna().copy()
+    new_c1["Is_Severe_Delay"] = (new_c1["ArrDelay"] >= 45).astype(int)
+    combined_X1 = pd.concat([X_train_c1, new_c1[features_c1]], ignore_index=True)
+    combined_y1 = pd.concat([y_train_class_c1, new_c1["Is_Severe_Delay"]], ignore_index=True)
+
+    scaler1_new = StandardScaler().fit(combined_X1)
+    Xtr1_new = scaler1_new.transform(combined_X1)
+    Xte1_new = scaler1_new.transform(X_test_c1)
+    rf1_new = RandomForestClassifier(n_estimators=100, max_depth=8, class_weight="balanced",
+                                      n_jobs=-1, random_state=42).fit(Xtr1_new, combined_y1)
+
+    orig_pred1 = rf_cls_c1.predict(X_test_scaled_c1)
+    orig_proba1 = rf_cls_c1.predict_proba(X_test_scaled_c1)[:, 1]
+    baseline_c1 = {
+        "Accuracy": accuracy_score(y_test_class_c1, orig_pred1),
+        "F1": f1_score(y_test_class_c1, orig_pred1),
+        "ROC-AUC": roc_auc_score(y_test_class_c1, orig_proba1),
+    }
+    new_pred1 = rf1_new.predict(Xte1_new)
+    new_proba1 = rf1_new.predict_proba(Xte1_new)[:, 1]
+    preview_c1 = {
+        "Accuracy": accuracy_score(y_test_class_c1, new_pred1),
+        "F1": f1_score(y_test_class_c1, new_pred1),
+        "ROC-AUC": roc_auc_score(y_test_class_c1, new_proba1),
+    }
+
+    # ---- Code 2: root cause ----
+    new_c2 = dfu[features_c2 + ["CarrierDelay", "WeatherDelay", "NASDelay"]].dropna().copy()
+    new_c2["RootCause"] = new_c2.apply(assign_root_cause, axis=1)
+    combined_X2 = pd.concat([X_train_c2, new_c2[features_c2]], ignore_index=True)
+    combined_y2 = pd.concat([y_train_class_c2, new_c2["RootCause"]], ignore_index=True)
+
+    scaler2_new = StandardScaler().fit(combined_X2)
+    Xtr2_new = scaler2_new.transform(combined_X2)
+    Xte2_new = scaler2_new.transform(X_test_c2)
+    rf2_new = RandomForestClassifier(n_estimators=100, max_depth=8, class_weight="balanced",
+                                      n_jobs=-1, random_state=42).fit(Xtr2_new, combined_y2)
+
+    orig_pred2 = rf_cls_c2.predict(X_test_scaled_c2)
+    baseline_c2 = {
+        "Accuracy": accuracy_score(y_test_class_c2, orig_pred2),
+        "F1 (macro)": f1_score(y_test_class_c2, orig_pred2, average="macro"),
+    }
+    new_pred2 = rf2_new.predict(Xte2_new)
+    preview_c2 = {
+        "Accuracy": accuracy_score(y_test_class_c2, new_pred2),
+        "F1 (macro)": f1_score(y_test_class_c2, new_pred2, average="macro"),
+    }
+
+    print(f"\n{len(dfu):,} new rows folded into training, evaluated against the SAME")
+    print("held-out test set the deployed models use. Deployed models are unchanged.\n")
+
+    comp1 = pd.DataFrame({"Original (deployed)": baseline_c1, "If retrained": preview_c1})
+    print("Code 1 — Severe Delay (Random Forest)")
+    print(comp1.round(4).to_string())
+
+    comp2 = pd.DataFrame({"Original (deployed)": baseline_c2, "If retrained": preview_c2})
+    print("\nCode 2 — Root Cause (Random Forest)")
+    print(comp2.round(4).to_string())
+    print("\n(Nothing was saved. Re-run this option any time — the deployed models stay as-is.)")
+
+
 def show_main_menu():
     print("\n" + "="*60)
     print("                    MAIN MENU")
@@ -1162,8 +1252,9 @@ def show_main_menu():
     print("10. Show Random Hold-Out Test Samples")
     print("11. Extra Models Visuals (NB / IsolationForest / LabelProp / SelfTrain / Ridge-Lasso / LightGBM / DBSCAN)")
     print("12. Upload & Score New Flights → DelayedFlightswupdates.csv")
+    print("13. Preview: What-If Retrain (compare vs deployed models)")
     print("0. Exit System")
-    return input("\nSelect an option (0-12): ").strip()
+    return input("\nSelect an option (0-13): ").strip()
 
 def show_predictor_menu():
     print("\n" + "="*60)
@@ -1308,14 +1399,16 @@ while True:
         evaluate_extra_models()
     elif eval_choice == '12':
         run_upload_and_score()
+    elif eval_choice == '13':
+        run_retrain_preview()
     elif eval_choice == '0':
         print("\nExiting Flight Analytics System. Have a great day!")
         break
     else:
-        print("\nInvalid choice. Please enter a number from 0–12.")
+        print("\nInvalid choice. Please enter a number from 0–13.")
 
     # After any evaluation (1–8, 10), offer a quick continue prompt
-    if eval_choice in {'1', '2', '3', '4', '5', '6', '7', '8', '10', '11', '12'}:
+    if eval_choice in {'1', '2', '3', '4', '5', '6', '7', '8', '10', '11', '12', '13'}:
         cont = input("\nPress Enter to return to Main Menu (or type 0 then Enter to Exit): ").strip()
         if cont == '0':
             print("\nExiting Flight Analytics System. Have a great day!")
