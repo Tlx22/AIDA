@@ -70,6 +70,14 @@ app_mode = st.sidebar.selectbox(
 
 MAX_ROWS = 35000  # heavier cloud sample (still within free-tier budget)
 
+def assign_root_cause(row):
+    """Module-level so it can be reused for retrain-preview scoring on new data."""
+    delays = {'Carrier': row['CarrierDelay'], 'Weather': row['WeatherDelay'], 'NAS/Hub': row['NASDelay']}
+    max_delay = max(delays.values())
+    if max_delay == 0:
+        return 'Carrier'
+    return max(k for k, v in delays.items() if v == max_delay)
+
 @st.cache_data(show_spinner="Loading data…")
 def load_data():
     cols = [
@@ -133,13 +141,6 @@ def train_core(test_r: float):
     for c in ['WeatherDelay', 'NASDelay', 'CarrierDelay']:
         df_c2[c] = df_c2[c].fillna(0)
 
-    def assign_root_cause(row):
-        delays = {'Carrier': row['CarrierDelay'], 'Weather': row['WeatherDelay'], 'NAS/Hub': row['NASDelay']}
-        max_delay = max(delays.values())
-        if max_delay == 0:
-            return 'Carrier'
-        return max(k for k, v in delays.items() if v == max_delay)
-
     df_c2['RootCause'] = df_c2.apply(assign_root_cause, axis=1)
     features_c2 = ['TaxiOut', 'AirTime', 'Distance']
     df_clean_c2 = df_c2[features_c2 + ['RootCause', 'CarrierDelay']].dropna()
@@ -190,10 +191,12 @@ def train_core(test_r: float):
         X_test_scaled_c1=X_test_scaled_c1, X_train_scaled_c1=X_train_scaled_c1,
         y_train_class_c1=y_train_class_c1, y_train_reg_c1=y_train_reg_c1,
         scaler_c1=scaler_c1, features_c1=features_c1, df_clean_c1=df_clean_c1,
+        X_train_c1=X_train_c1,
         X_test_c2=X_test_c2, y_test_class_c2=y_test_class_c2, y_test_reg_c2=y_test_reg_c2,
         X_test_scaled_c2=X_test_scaled_c2, X_train_scaled_c2=X_train_scaled_c2,
         y_train_class_c2=y_train_class_c2, y_train_reg_c2=y_train_reg_c2,
         scaler_c2=scaler_c2, features_c2=features_c2,
+        X_train_c2=X_train_c2, df_clean_c2=df_clean_c2,
         # models
         lin_reg_c1=lin_reg_c1, log_reg_c1=log_reg_c1, dt_cls_c1=dt_cls_c1, rf_cls_c1=rf_cls_c1,
         kmeans_c1=kmeans_c1, nn_cls_c1=nn_cls_c1,
@@ -296,6 +299,7 @@ ridge_c1 = core['ridge_c1']; lasso_c1 = core['lasso_c1']; ridge_c2 = core['ridge
 lgb_cls_c1 = core['lgb_cls_c1']; lgb_reg_c1 = core['lgb_reg_c1']
 lgb_cls_c2 = core['lgb_cls_c2']; lgb_reg_c2 = core['lgb_reg_c2']
 df_clean_c1 = core['df_clean_c1']
+X_train_c1 = core['X_train_c1']; X_train_c2 = core['X_train_c2']; df_clean_c2 = core['df_clean_c2']
 
 # ---- Heavy models only when advanced views are selected ----
 _need_heavy = app_mode in (
@@ -479,6 +483,65 @@ if app_mode == "Upload & Score New Flights":
             out["Pred_RootCause_LGBM"] = lgb_cls_c2.predict(X2s)
         return out
 
+    def simulate_retrain_preview(new_rows: pd.DataFrame) -> dict:
+        """Refit RF models on original-train + new_rows, evaluate on the SAME held-out
+        test set as the deployed models. Deployed models are never touched."""
+        # ---- Code 1: severe delay ----
+        new_c1 = new_rows[features_c1 + ["ArrDelay"]].dropna().copy()
+        new_c1["Is_Severe_Delay"] = (new_c1["ArrDelay"] >= 45).astype(int)
+        combined_X1 = pd.concat([X_train_c1, new_c1[features_c1]], ignore_index=True)
+        combined_y1 = pd.concat([y_train_class_c1, new_c1["Is_Severe_Delay"]], ignore_index=True)
+
+        scaler1_new = StandardScaler().fit(combined_X1)
+        Xtr1_new = scaler1_new.transform(combined_X1)
+        Xte1_new = scaler1_new.transform(X_test_c1)
+        rf1_new = RandomForestClassifier(n_estimators=80, max_depth=8, class_weight="balanced",
+                                          n_jobs=-1, random_state=42).fit(Xtr1_new, combined_y1)
+
+        orig_pred1 = rf_cls_c1.predict(X_test_scaled_c1)
+        orig_proba1 = rf_cls_c1.predict_proba(X_test_scaled_c1)[:, 1]
+        baseline_c1 = {
+            "Accuracy": accuracy_score(y_test_class_c1, orig_pred1),
+            "F1": f1_score(y_test_class_c1, orig_pred1),
+            "ROC-AUC": roc_auc_score(y_test_class_c1, orig_proba1),
+        }
+        new_pred1 = rf1_new.predict(Xte1_new)
+        new_proba1 = rf1_new.predict_proba(Xte1_new)[:, 1]
+        preview_c1 = {
+            "Accuracy": accuracy_score(y_test_class_c1, new_pred1),
+            "F1": f1_score(y_test_class_c1, new_pred1),
+            "ROC-AUC": roc_auc_score(y_test_class_c1, new_proba1),
+        }
+
+        # ---- Code 2: root cause ----
+        new_c2 = new_rows[features_c2 + ["CarrierDelay", "WeatherDelay", "NASDelay"]].dropna().copy()
+        new_c2["RootCause"] = new_c2.apply(assign_root_cause, axis=1)
+        combined_X2 = pd.concat([X_train_c2, new_c2[features_c2]], ignore_index=True)
+        combined_y2 = pd.concat([y_train_class_c2, new_c2["RootCause"]], ignore_index=True)
+
+        scaler2_new = StandardScaler().fit(combined_X2)
+        Xtr2_new = scaler2_new.transform(combined_X2)
+        Xte2_new = scaler2_new.transform(X_test_c2)
+        rf2_new = RandomForestClassifier(n_estimators=80, max_depth=8, class_weight="balanced",
+                                          n_jobs=-1, random_state=42).fit(Xtr2_new, combined_y2)
+
+        orig_pred2 = rf_cls_c2.predict(X_test_scaled_c2)
+        baseline_c2 = {
+            "Accuracy": accuracy_score(y_test_class_c2, orig_pred2),
+            "F1 (macro)": f1_score(y_test_class_c2, orig_pred2, average="macro"),
+        }
+        new_pred2 = rf2_new.predict(Xte2_new)
+        preview_c2 = {
+            "Accuracy": accuracy_score(y_test_class_c2, new_pred2),
+            "F1 (macro)": f1_score(y_test_class_c2, new_pred2, average="macro"),
+        }
+
+        return {
+            "n_new_rows": len(new_rows),
+            "baseline_c1": baseline_c1, "preview_c1": preview_c1,
+            "baseline_c2": baseline_c2, "preview_c2": preview_c2,
+        }
+
     scored = None
     source_label = ""
 
@@ -637,6 +700,47 @@ if app_mode == "Upload & Score New Flights":
                 if st.button("Clear working set"):
                     st.session_state["updates_df"] = pd.DataFrame()
                     st.rerun()
+
+        # ---- Retrain preview: "what would change if we retrained with this data" ----
+        st.subheader("🔮 Preview: impact of retraining with this data")
+        st.caption(
+            "Simulates refitting the Random Forest models with your session working-set rows "
+            "added to training, evaluated on the same held-out test set as the live models. "
+            "This does **not** change the deployed models — it's a side-by-side estimate only."
+        )
+        wset = st.session_state["updates_df"]
+        pcol1, pcol2 = st.columns(2)
+        with pcol1:
+            sim_disabled = len(wset) == 0
+            if st.button(f"Simulate retrain with {len(wset):,} working-set rows", disabled=sim_disabled):
+                with st.spinner("Refitting preview models…"):
+                    st.session_state["retrain_preview"] = simulate_retrain_preview(wset)
+        with pcol2:
+            if st.button("🔄 Reset to original (discard preview)"):
+                st.session_state.pop("retrain_preview", None)
+                st.rerun()
+
+        preview = st.session_state.get("retrain_preview")
+        if preview:
+            st.success(
+                f"Preview based on {preview['n_new_rows']:,} new rows, evaluated against the "
+                f"original held-out test set."
+            )
+            comp1 = pd.DataFrame({
+                "Original (deployed)": preview["baseline_c1"],
+                "If retrained": preview["preview_c1"],
+            })
+            st.write("**Code 1 — Severe Delay (Random Forest)**")
+            st.dataframe(comp1.style.format("{:.3f}"))
+
+            comp2 = pd.DataFrame({
+                "Original (deployed)": preview["baseline_c2"],
+                "If retrained": preview["preview_c2"],
+            })
+            st.write("**Code 2 — Root Cause (Random Forest)**")
+            st.dataframe(comp2.style.format("{:.3f}"))
+        else:
+            st.caption("No preview yet — the original (deployed) model values are what's shown everywhere else in the app.")
     else:
         st.write("Upload a file or enable **Score this manual row** to begin.")
 
@@ -913,10 +1017,16 @@ elif app_mode == "Interactive Predictor & Diagnostics":
             st.caption("Neural Network skipped on Cloud for speed (use local app for MLP).")
 
         st.write("#### Decision Tree Diagram")
-        fig, ax = plt.subplots(figsize=(18, 9))
+        depth_c1 = st.slider("Levels to display", min_value=2, max_value=dt_cls_c1.get_depth(),
+                              value=min(3, dt_cls_c1.get_depth()), key="tree_depth_c1")
+        fig_w = min(40, 4 * (2 ** (depth_c1 - 1)))
+        fig, ax = plt.subplots(figsize=(fig_w, 3 * depth_c1))
         plot_tree(dt_cls_c1, feature_names=features_c1, class_names=['On-Time', 'Delayed'],
-                  filled=True, ax=ax, fontsize=10, rounded=True, precision=2)
+                  filled=True, ax=ax, fontsize=9, rounded=True, precision=2,
+                  max_depth=depth_c1, impurity=False)
         st.pyplot(fig); plt.close(fig)
+        st.caption(f"Showing top {depth_c1} of {dt_cls_c1.get_depth()} levels "
+                   f"({dt_cls_c1.get_n_leaves()} total leaves in the full tree).")
 
     else:
         st.subheader("Enter Operational Parameters (Code 2)")
@@ -1011,10 +1121,16 @@ elif app_mode == "Interactive Predictor & Diagnostics":
             st.caption("Neural Network skipped on Cloud for speed.")
 
         st.write("#### Decision Tree Breakdown")
-        fig, ax = plt.subplots(figsize=(20, 9))
+        depth_c2 = st.slider("Levels to display", min_value=2, max_value=dt_cls_c2.get_depth(),
+                              value=min(3, dt_cls_c2.get_depth()), key="tree_depth_c2")
+        fig_w = min(40, 4 * (2 ** (depth_c2 - 1)))
+        fig, ax = plt.subplots(figsize=(fig_w, 3 * depth_c2))
         plot_tree(dt_cls_c2, feature_names=features_c2, class_names=list(dt_cls_c2.classes_),
-                  filled=True, ax=ax, fontsize=10, rounded=True, precision=2)
+                  filled=True, ax=ax, fontsize=9, rounded=True, precision=2,
+                  max_depth=depth_c2, impurity=False)
         st.pyplot(fig); plt.close(fig)
+        st.caption(f"Showing top {depth_c2} of {dt_cls_c2.get_depth()} levels "
+                   f"({dt_cls_c2.get_n_leaves()} total leaves in the full tree).")
 
 # =========================================================================
 # MODEL EVALUATIONS (includes SVM)
